@@ -5,6 +5,10 @@ const PDFDocument = require('pdfkit');
 const nodemailer = require('nodemailer');
 
 const app = express();
+app.get("/", (req, res) => {
+  res.send("🔥 Backend ETHERE4L activo y funcionando");
+});
+
 
 // 1. Middlewares
 app.use(cors()); // Permite conexiones desde cualquier origen (Netlify/Localhost)
