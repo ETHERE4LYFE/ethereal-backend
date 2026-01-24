@@ -1,0 +1,27 @@
+{
+  "name": "ethere4l-backend",
+  "version": "1.0.0",
+  "description": "Backend ligero para procesamiento de pedidos y generación de PDF para ETHERE4L",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "keywords": [
+    "ecommerce",
+    "pdf",
+    "backend"
+  ],
+  "author": "ETHERE4L Dev",
+  "license": "ISC",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "nodemailer": "^6.9.7",
+    "pdfkit": "^0.14.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}
