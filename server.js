@@ -8,72 +8,90 @@ const { Resend } = require('resend');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Marca de agua para logs (Verificar versión en Railway)
+// Logs de arranque
 console.log("___________________________________________________");
 console.log("🚀 BOOTING: ETHERE4L BACKEND - RESEND ONLY EDITION");
 console.log("🚫 PROTOCOL: NO-SMTP | ARCHITECTURE: FIRE-AND-FORGET");
 console.log("___________________________________________________");
 
-// Validación de entorno
-if (!process.env.RESEND_API_KEY) {
-    console.error("🚨 [FATAL] RESEND_API_KEY no encontrada. El servidor no iniciará.");
+// Detectar entorno real
+const isRailway = !!process.env.RAILWAY_ENVIRONMENT;
+const isProduction = process.env.NODE_ENV === 'production';
+
+// Validación SEGURA de variables (NO rompe build)
+let resend = null;
+
+if (isProduction && isRailway && !process.env.RESEND_API_KEY) {
+    console.error("🚨 [FATAL] RESEND_API_KEY no encontrada en producción.");
     process.exit(1);
 }
 
-const resend = new Resend(process.env.RESEND_API_KEY);
+if (process.env.RESEND_API_KEY) {
+    resend = new Resend(process.env.RESEND_API_KEY);
+} else {
+    console.warn("⚠️ RESEND_API_KEY no detectada (modo build / local).");
+}
+
+if (!process.env.ADMIN_EMAIL) {
+    console.warn("⚠️ ADMIN_EMAIL no configurado. Emails no serán enviados.");
+}
 
 // Middlewares
 app.use(cors());
 app.use(express.json());
 
-// --- ENDPOINT ---
+// --- ENDPOINT PRINCIPAL ---
 app.post('/api/crear-pedido', (req, res) => {
     const { cliente, pedido } = req.body;
 
-    // 1. Validación rápida
     if (!cliente || !pedido || !pedido.items) {
         console.warn("⚠️ Payload inválido recibido.");
-        return res.status(400).json({ success: false, message: "Datos incompletos." });
+        return res.status(400).json({
+            success: false,
+            message: "Datos incompletos."
+        });
     }
 
-    // 2. ID de Trazabilidad (Job ID)
     const jobId = `JOB-${Date.now().toString().slice(-6)}`;
 
-    // 3. RESPUESTA INMEDIATA (HTTP 200)
-    // El frontend recibe esto en < 100ms
+    // RESPUESTA INMEDIATA
     res.json({
         success: true,
-        message: 'Pedido recibido. Procesando PDF y Email en segundo plano.',
-        jobId: jobId
+        message: 'Pedido recibido. Procesando en segundo plano.',
+        jobId
     });
 
-    console.log(`⚡ [${jobId}] Request HTTP cerrado. Iniciando background task...`);
+    console.log(`⚡ [${jobId}] HTTP cerrado. Lanzando background task...`);
 
-    // 4. FIRE-AND-FORGET (Ejecución diferida)
     setImmediate(() => {
         runBackgroundTask(jobId, cliente, pedido);
     });
 });
 
-// --- BACKGROUND WORKER ---
+// --- WORKER DE FONDO ---
 async function runBackgroundTask(jobId, cliente, pedido) {
     try {
         console.log(`⚙️ [${jobId}] Generando PDF...`);
-        
-        // A. Generar PDF
         const pdfBuffer = await generatePDF(cliente, pedido);
-        console.log(`✅ [${jobId}] PDF generado (${pdfBuffer.length} bytes). Enviando a Resend API...`);
+        console.log(`✅ [${jobId}] PDF generado (${pdfBuffer.length} bytes)`);
 
-        // B. Enviar Email vía HTTP (Resend)
+        // Si no hay configuración de email, TERMINAMOS AQUÍ (sin error)
+        if (!resend || !process.env.ADMIN_EMAIL) {
+            console.warn(`⚠️ [${jobId}] Email omitido (configuración incompleta).`);
+            return;
+        }
+
+        console.log(`📨 [${jobId}] Enviando email vía Resend...`);
+
         const { data, error } = await resend.emails.send({
-            from: 'ETHERE4L <onboarding@resend.dev>', // Cambiar en producción
-            to: [process.env.ADMIN_EMAIL],
+            from: 'ETHERE4L <onboarding@resend.dev>', // cambiar cuando tengas dominio
+            to: process.env.ADMIN_EMAIL,
             subject: `Nueva Venta: ${cliente.nombre} ($${pedido.total})`,
             html: `
                 <h3>Nueva Orden ${jobId}</h3>
-                <p>Cliente: ${cliente.nombre}</p>
-                <p>Total: $${pedido.total}</p>
-                <p>Ver adjunto.</p>
+                <p><strong>Cliente:</strong> ${cliente.nombre}</p>
+                <p><strong>Total:</strong> $${pedido.total}</p>
+                <p>Ver PDF adjunto.</p>
             `,
             attachments: [
                 {
@@ -84,36 +102,58 @@ async function runBackgroundTask(jobId, cliente, pedido) {
         });
 
         if (error) {
-            console.error(`🛑 [${jobId}] Resend API Error:`, error);
+            console.error(`🛑 [${jobId}] Resend Error:`, error);
         } else {
-            console.log(`🎉 [${jobId}] COMPLETADO. Email ID: ${data.id}`);
+            console.log(`🎉 [${jobId}] Email enviado. ID: ${data.id}`);
         }
 
     } catch (err) {
-        console.error(`🔥 [${jobId}] CRASH EN BACKGROUND:`, err.message);
+        console.error(`🔥 [${jobId}] Error en background task:`, err);
     }
 }
 
-// --- HELPER PDF ---
+// --- GENERADOR DE PDF ---
 function generatePDF(cliente, pedido) {
     return new Promise((resolve, reject) => {
         try {
             const doc = new PDFDocument();
-            let buffers = [];
+            const buffers = [];
+
             doc.on('data', buffers.push.bind(buffers));
             doc.on('end', () => resolve(Buffer.concat(buffers)));
-            
+
             doc.fontSize(20).text('ETHERE4L', { align: 'center' });
-            doc.text(`Orden: ${cliente.nombre}`);
+            doc.moveDown();
+            doc.fontSize(12).text(`Cliente: ${cliente.nombre}`);
             doc.text(`Total: $${pedido.total}`);
-            
+            doc.moveDown();
+
             pedido.items.forEach(item => {
-                doc.fontSize(12).text(`- ${item.nombre} (${item.talla})`);
+                doc.text(`• ${item.nombre} (${item.talla})`);
             });
-            
+
             doc.end();
-        } catch (e) { reject(e); }
+        } catch (e) {
+            reject(e);
+        }
     });
 }
 
-app.listen(PORT, () => console.log(`🟢 Server listening on port ${PORT}`));
+// --- PROTECCIÓN GLOBAL ---
+process.on('unhandledRejection', reason => {
+    console.error('🔥 Unhandled Rejection:', reason);
+});
+
+process.on('uncaughtException', err => {
+    console.error('🔥 Uncaught Exception:', err);
+});
+
+// Health check
+app.get('/', (req, res) => {
+    res.send('🟢 ETHERE4L Backend Online');
+});
+
+// Start
+app.listen(PORT, () => {
+    console.log(`🟢 Server listening on port ${PORT}`);
+});
