@@ -4,16 +4,19 @@ const cors = require('cors');
 const PDFDocument = require('pdfkit');
 const { Resend } = require('resend');
 
-// --- 1. CONFIGURACIÓN Y SEGURIDAD ---
+// --- CONFIGURACIÓN ---
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Validación estricta al inicio
-const requiredEnv = ['RESEND_API_KEY', 'ADMIN_EMAIL'];
-const missingEnv = requiredEnv.filter(key => !process.env[key]);
+// Marca de agua para logs (Verificar versión en Railway)
+console.log("___________________________________________________");
+console.log("🚀 BOOTING: ETHERE4L BACKEND - RESEND ONLY EDITION");
+console.log("🚫 PROTOCOL: NO-SMTP | ARCHITECTURE: FIRE-AND-FORGET");
+console.log("___________________________________________________");
 
-if (missingEnv.length > 0) {
-    console.error(`🚨 [FATAL] Faltan variables: ${missingEnv.join(', ')}`);
+// Validación de entorno
+if (!process.env.RESEND_API_KEY) {
+    console.error("🚨 [FATAL] RESEND_API_KEY no encontrada. El servidor no iniciará.");
     process.exit(1);
 }
 
@@ -23,155 +26,94 @@ const resend = new Resend(process.env.RESEND_API_KEY);
 app.use(cors());
 app.use(express.json());
 
-// --- 2. MANEJO DE ERRORES GLOBALES (CRÍTICO PARA BACKGROUND TASKS) ---
-// Evita que el servidor se reinicie si una tarea de fondo falla
-process.on('unhandledRejection', (reason, promise) => {
-    console.error('🔥 [CRITICAL] Unhandled Rejection at:', promise, 'reason:', reason);
-    // No salimos del proceso, solo logueamos para mantener vivo el servidor
-});
-
-process.on('uncaughtException', (error) => {
-    console.error('🔥 [CRITICAL] Uncaught Exception:', error);
-});
-
-// Health Check
-app.get("/", (req, res) => res.send("🟢 Backend ETHERE4L (Robust Mode) Online"));
-
-// --- 3. ENDPOINT PRINCIPAL (OPTIMIZADO) ---
+// --- ENDPOINT ---
 app.post('/api/crear-pedido', (req, res) => {
     const { cliente, pedido } = req.body;
 
-    // A. Validación Sincrónica
+    // 1. Validación rápida
     if (!cliente || !pedido || !pedido.items) {
-        console.warn("⚠️ [REJECT] Payload inválido recibido.");
+        console.warn("⚠️ Payload inválido recibido.");
         return res.status(400).json({ success: false, message: "Datos incompletos." });
     }
 
-    // B. Generar ID de Tarea para Trazabilidad
-    const jobId = `JOB-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+    // 2. ID de Trazabilidad (Job ID)
+    const jobId = `JOB-${Date.now().toString().slice(-6)}`;
 
-    // C. RESPUESTA INMEDIATA (The "Fire" part)
-    // Respondemos antes de hacer nada pesado
-    res.status(200).json({ 
-        success: true, 
-        message: "Pedido recibido. Procesando en segundo plano.",
-        jobId: jobId 
+    // 3. RESPUESTA INMEDIATA (HTTP 200)
+    // El frontend recibe esto en < 100ms
+    res.json({
+        success: true,
+        message: 'Pedido recibido. Procesando PDF y Email en segundo plano.',
+        jobId: jobId
     });
 
-    console.log(`🚀 [${jobId}] Request HTTP completado. Iniciando Handover...`);
+    console.log(`⚡ [${jobId}] Request HTTP cerrado. Iniciando background task...`);
 
-    // D. EJECUCIÓN DIFERIDA (The "Forget" part)
-    // setImmediate garantiza que esto corra EN EL SIGUIENTE TICK del Event Loop
-    // Esto asegura que la conexión HTTP ya se cerró completamente.
+    // 4. FIRE-AND-FORGET (Ejecución diferida)
     setImmediate(() => {
-        processBackgroundOrder(jobId, cliente, pedido);
+        runBackgroundTask(jobId, cliente, pedido);
     });
 });
 
-/**
- * 4. WORKER INTERNO (Lógica de Negocio)
- * Ejecuta PDF y Email de forma aislada y segura.
- */
-async function processBackgroundOrder(jobId, cliente, pedido) {
-    console.log(`⚙️ [${jobId}] 1. Iniciando Worker Interno...`);
-
+// --- BACKGROUND WORKER ---
+async function runBackgroundTask(jobId, cliente, pedido) {
     try {
-        // PASO 1: Generar PDF
-        const startPdf = Date.now();
-        const pdfBuffer = await generatePDFSafe(jobId, cliente, pedido);
-        console.log(`✅ [${jobId}] 2. PDF Generado (${Date.now() - startPdf}ms) | Tamaño: ${pdfBuffer.length} bytes`);
-
-        // PASO 2: Enviar Email
-        console.log(`ep [${jobId}] 3. Intentando enviar email a ${process.env.ADMIN_EMAIL}...`);
+        console.log(`⚙️ [${jobId}] Generando PDF...`);
         
+        // A. Generar PDF
+        const pdfBuffer = await generatePDF(cliente, pedido);
+        console.log(`✅ [${jobId}] PDF generado (${pdfBuffer.length} bytes). Enviando a Resend API...`);
+
+        // B. Enviar Email vía HTTP (Resend)
         const { data, error } = await resend.emails.send({
-            from: 'ETHERE4L <onboarding@resend.dev>', // Cambiar a tu dominio verificado en prod
+            from: 'ETHERE4L <onboarding@resend.dev>', // Cambiar en producción
             to: [process.env.ADMIN_EMAIL],
-            subject: `NUEVA VENTA: ${cliente.nombre} ($${pedido.total})`,
-            html: generateEmailHTML(cliente, pedido),
+            subject: `Nueva Venta: ${cliente.nombre} ($${pedido.total})`,
+            html: `
+                <h3>Nueva Orden ${jobId}</h3>
+                <p>Cliente: ${cliente.nombre}</p>
+                <p>Total: $${pedido.total}</p>
+                <p>Ver adjunto.</p>
+            `,
             attachments: [
                 {
-                    filename: `Orden_${cliente.nombre.replace(/[^a-zA-Z0-9]/g, '_')}_${jobId}.pdf`,
+                    filename: `Orden_${jobId}.pdf`,
                     content: pdfBuffer
                 }
             ]
         });
 
         if (error) {
-            console.error(`⚠️ [${jobId}] Error devuelto por API Resend:`, error);
+            console.error(`🛑 [${jobId}] Resend API Error:`, error);
         } else {
-            console.log(`🎉 [${jobId}] 4. PROCESO COMPLETADO EXITOSAMENTE. Email ID: ${data.id}`);
+            console.log(`🎉 [${jobId}] COMPLETADO. Email ID: ${data.id}`);
         }
 
     } catch (err) {
-        // Captura errores catastróficos dentro del worker para no ensuciar el log global
-        console.error(`❌ [${jobId}] FALLO EN TAREA DE FONDO:`, err.message);
-        console.error(err.stack);
+        console.error(`🔥 [${jobId}] CRASH EN BACKGROUND:`, err.message);
     }
 }
 
-// --- 5. HELPERS (Robustecidos) ---
-
-function generatePDFSafe(jobId, cliente, pedido) {
+// --- HELPER PDF ---
+function generatePDF(cliente, pedido) {
     return new Promise((resolve, reject) => {
         try {
-            const doc = new PDFDocument({ margin: 50 });
+            const doc = new PDFDocument();
             let buffers = [];
-
-            // Manejo de errores del stream interno de PDFKit
-            doc.on('error', (err) => {
-                console.error(`🔥 [${jobId}] Error interno PDFKit:`, err);
-                reject(err);
-            });
-
             doc.on('data', buffers.push.bind(buffers));
             doc.on('end', () => resolve(Buffer.concat(buffers)));
-
-            // --- CONTENIDO PDF ---
-            doc.fontSize(20).font('Helvetica-Bold').text('ETHERE4L', { align: 'center' });
-            doc.fontSize(10).text(`Orden Ref: ${jobId}`, { align: 'center' });
-            doc.moveDown();
             
-            doc.fontSize(12).font('Helvetica-Bold').text('Cliente:');
-            doc.fontSize(10).font('Helvetica').text(`Nombre: ${cliente.nombre}`);
-            doc.text(`Tel: ${cliente.telefono}`);
-            doc.text(`Dir: ${cliente.direccion}`);
-            if(cliente.notas) doc.text(`Notas: ${cliente.notas}`);
-            doc.moveDown();
-
-            doc.fontSize(12).font('Helvetica-Bold').text('Items:');
+            doc.fontSize(20).text('ETHERE4L', { align: 'center' });
+            doc.text(`Orden: ${cliente.nombre}`);
+            doc.text(`Total: $${pedido.total}`);
+            
             pedido.items.forEach(item => {
-                // Sanitización por si viene null
-                const nombre = item.nombre || "Item";
-                const precio = item.precio || 0;
-                doc.fontSize(10).text(`• ${nombre} (${item.talla}) x${item.cantidad} - $${precio}`);
+                doc.fontSize(12).text(`- ${item.nombre} (${item.talla})`);
             });
             
-            doc.moveDown();
-            doc.fontSize(14).font('Helvetica-Bold').text(`TOTAL: $${pedido.total}`, { align: 'right' });
-            
-            doc.end(); // Finalizar stream explícitamente
-
-        } catch (e) {
-            reject(e);
-        }
+            doc.end();
+        } catch (e) { reject(e); }
     });
 }
 
-function generateEmailHTML(cliente, pedido) {
-    return `
-        <div style="font-family: sans-serif; padding: 20px;">
-            <h2 style="color: #000;">Nueva Orden Recibida</h2>
-            <p><strong>Cliente:</strong> ${cliente.nombre}</p>
-            <p><strong>Teléfono:</strong> ${cliente.telefono}</p>
-            <p><strong>Total:</strong> $${pedido.total}</p>
-            <hr/>
-            <p style="color: #666;">El detalle completo se encuentra en el PDF adjunto.</p>
-        </div>
-    `;
-}
-
-// Iniciar Servidor
-app.listen(PORT, () => {
-    console.log(`✅ Servidor ETHERE4L (Deterministic Queue) corriendo en puerto ${PORT}`);
-});
+app.listen(PORT, () => console.log(`🟢 Server listening on port ${PORT}`));
