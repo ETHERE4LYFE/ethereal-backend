@@ -128,6 +128,16 @@ function generatePDF(cliente, pedido) {
     });
 }
 
+app.get('/', (req, res) => {
+  res.status(200).json({
+    status: 'ok',
+    service: 'ETHERE4L backend',
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString()
+  });
+});
+
+
 // --- 9. START SERVER ---
 const server = app.listen(portToUse, '0.0.0.0', () => {
     console.log("==================================");
