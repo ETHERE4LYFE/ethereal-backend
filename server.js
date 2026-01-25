@@ -81,31 +81,50 @@ app.post('/api/crear-pedido', (req, res) => {
 
 // --- 7. BACKGROUND TASK ---
 async function runBackgroundTask(jobId, cliente, pedido) {
-    console.log(`⚙️ [${jobId}] Generating PDF...`);
-    const pdfBuffer = await generatePDF(cliente, pedido);
+    try {
+        // 1. Generación de PDF (Independiente)
+        console.log(`⚙️ [${jobId}] Generando PDF...`);
+        const pdfBuffer = await generatePDF(cliente, pedido);
+        
+        // 2. Lógica de Enrutamiento de Email
+        // Si no hay dominio verificado, Resend SOLO permite enviar al dueño de la cuenta.
+        const isProductionDomainVerified = process.env.DOMAIN_VERIFIED === 'true'; 
+        
+        const recipient = isProductionDomainVerified 
+            ? cliente.email // Producción real (requiere dominio verificado)
+            : process.env.ADMIN_EMAIL; // Fallback Sandbox (siempre al admin)
 
-    if (!resend) {
-        console.warn(`🛑 [${jobId}] Email skipped (Resend disabled)`);
-        return;
-    }
+        const emailSubject = isProductionDomainVerified
+            ? `Confirmación de Pedido - ETHERE4L`
+            : `[SANDBOX] Nuevo Pedido de ${cliente.nombre}`; // Subject claro para debug
 
-    if (!process.env.ADMIN_EMAIL) {
-        console.warn(`🛑 [${jobId}] Email skipped (ADMIN_EMAIL missing)`);
-        return;
-    }
+        console.log(`✉️ [${jobId}] Enviando email a: ${recipient} (Modo: ${isProductionDomainVerified ? 'PROD' : 'SANDBOX'})`);
 
-    const { error, data } = await resend.emails.send({
-        from: 'ETHERE4L <onboarding@resend.dev>',
-        to: process.env.ADMIN_EMAIL,
-        subject: `Nueva Orden (${jobId})`,
-        html: `<p>Cliente: ${cliente.nombre}</p><p>Total: $${pedido.total}</p>`,
-        attachments: [{ filename: `orden_${jobId}.pdf`, content: pdfBuffer }]
-    });
+        const { data, error } = await resend.emails.send({
+            from: 'ETHERE4L <ventas@ethere4l.com>', // En Prod cambiar a: ventas@tudominio.com
+            to: [recipient], 
+            // Si estamos en Sandbox, agregamos Bcc al admin para asegurar que llegue
+            // Ojo: En Sandbox 'to' y 'bcc' deben ser correos verificados/propios.
+            subject: emailSubject,
+            html: generateEmailHTML(cliente, pedido), // Tu helper HTML
+            attachments: [{ filename: `Orden_${jobId}.pdf`, content: pdfBuffer }]
+        });
 
-    if (error) {
-        console.error(`⚠️ [${jobId}] Resend error:`, error);
-    } else {
-        console.log(`🎉 [${jobId}] Email sent (${data.id})`);
+        if (error) {
+            // Log estructurado del error 403 u otros
+            console.error(`🛑 [${jobId}] Error Resend [${error.name}]: ${error.message}`);
+            // Aquí confirmamos que el PDF se generó pero falló el envío.
+        } else {
+            console.log(`🎉 [${jobId}] Email enviado. ID: ${data.id}`);
+        }
+        if (error) {
+    console.error(`🛑 [${jobId}] FALLO ENVÍO EMAIL. ERROR: ${error.message}`);
+    // DUMP DE SEGURIDAD:
+    console.warn(`💾 [${jobId}] DATA BACKUP:`, JSON.stringify({ cliente, pedido }));
+}
+
+    } catch (err) {
+        console.error(`🔥 [${jobId}] Crash en Worker:`, err);
     }
 }
 
