@@ -115,21 +115,23 @@ async function runBackgroundTask(jobId, cliente, pedido) {
             return;
         }
 
-        const isProductionDomainVerified = process.env.DOMAIN_VERIFIED === 'true';
+        // 🔐 EMAIL SEGURO (NUNCA undefined)
+        const clientEmail =
+            typeof cliente.email === 'string' && cliente.email.includes('@')
+                ? cliente.email
+                : null;
 
-        const recipient = isProductionDomainVerified
-            ? cliente.email
-            : process.env.ADMIN_EMAIL;
+        const recipient = clientEmail || process.env.ADMIN_EMAIL;
 
-        const subject = isProductionDomainVerified
+        const subject = clientEmail
             ? 'Confirmación de Pedido - ETHERE4L'
-            : `[SANDBOX] Nuevo pedido - ${jobId}`;
+            : `[ADMIN] Nuevo pedido recibido - ${jobId}`;
 
         console.log(`✉️ [${jobId}] Enviando email a ${recipient}`);
 
         const { error } = await resend.emails.send({
             from: 'ETHERE4L <ventas@ethere4l.com>',
-            to: [recipient],
+            to: recipient,
             subject,
             html: generateEmailHTML(cliente, pedido, jobId),
             attachments: [{
@@ -181,4 +183,3 @@ process.on('SIGTERM', () => {
     console.log('SIGTERM received. Closing server...');
     server.close(() => console.log('Server closed'));
 });
-
