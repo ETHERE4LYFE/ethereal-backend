@@ -2,7 +2,7 @@
 // ETHERE4L BACKEND – RAILWAY SAFE
 // ===============================
 
-// ⚠️ dotenv SOLO en local
+// dotenv SOLO en local
 if (process.env.NODE_ENV !== 'production') {
     require('dotenv').config();
 }
@@ -25,10 +25,10 @@ if (rawPort) {
         portToUse = parsedPort;
         console.log(`✅ Using Railway PORT: ${portToUse}`);
     } else {
-        console.warn(`⚠️ Invalid PORT received ("${rawPort}"). Falling back to 3000`);
+        console.warn(`⚠️ Invalid PORT received ("${rawPort}"). Using 3000`);
     }
 } else {
-    console.warn("⚠️ No PORT provided by Railway. Using 3000");
+    console.warn("⚠️ No PORT provided. Using 3000");
 }
 
 // --- 3. RESEND (GRACEFUL INIT) ---
@@ -42,16 +42,21 @@ if (process.env.RESEND_API_KEY && process.env.RESEND_API_KEY.trim() !== "") {
         console.error("❌ Failed to initialize Resend:", err.message);
     }
 } else {
-    console.warn("⚠️ RESEND_API_KEY missing. Email sending disabled.");
+    console.warn("⚠️ RESEND_API_KEY missing. Email disabled.");
 }
 
 // --- 4. MIDDLEWARES ---
 app.use(cors());
 app.use(express.json());
 
-// --- 5. HEALTH CHECK (CRÍTICO PARA RAILWAY) ---
+// --- 5. HEALTH CHECK ---
 app.get('/', (req, res) => {
-    res.status(200).send('🟢 ETHERE4L Backend Online');
+    res.status(200).json({
+        status: 'ok',
+        service: 'ETHERE4L backend',
+        uptime: process.uptime(),
+        timestamp: new Date().toISOString()
+    });
 });
 
 // --- 6. API ---
@@ -59,7 +64,7 @@ app.post('/api/crear-pedido', (req, res) => {
     const { cliente, pedido } = req.body;
 
     if (!cliente || !pedido || !Array.isArray(pedido.items)) {
-        console.warn("⚠️ Invalid payload received");
+        console.warn("⚠️ Invalid payload");
         return res.status(400).json({ success: false, message: "Datos incompletos" });
     }
 
@@ -79,56 +84,73 @@ app.post('/api/crear-pedido', (req, res) => {
     });
 });
 
-// --- 7. BACKGROUND TASK ---
+// --- 7. EMAIL HTML ---
+function generateEmailHTML(cliente, pedido, jobId) {
+    return `
+        <div style="font-family: Arial, sans-serif;">
+            <h2>🛍️ Confirmación de pedido - ETHERE4L</h2>
+            <p><strong>ID:</strong> ${jobId}</p>
+            <p><strong>Cliente:</strong> ${cliente.nombre || 'N/A'}</p>
+            <p><strong>Email:</strong> ${cliente.email || 'N/A'}</p>
+            <hr />
+            <ul>
+                ${pedido.items.map(item => `
+                    <li>${item.nombre} × ${item.cantidad}</li>
+                `).join('')}
+            </ul>
+            <p><strong>Total:</strong> $${pedido.total}</p>
+            <p>📎 PDF adjunto con el detalle de tu orden.</p>
+        </div>
+    `;
+}
+
+// --- 8. BACKGROUND TASK ---
 async function runBackgroundTask(jobId, cliente, pedido) {
     try {
-        // 1. Generación de PDF (Independiente)
         console.log(`⚙️ [${jobId}] Generando PDF...`);
         const pdfBuffer = await generatePDF(cliente, pedido);
-        
-        // 2. Lógica de Enrutamiento de Email
-        // Si no hay dominio verificado, Resend SOLO permite enviar al dueño de la cuenta.
-        const isProductionDomainVerified = process.env.DOMAIN_VERIFIED === 'true'; 
-        
-        const recipient = isProductionDomainVerified 
-            ? cliente.email // Producción real (requiere dominio verificado)
-            : process.env.ADMIN_EMAIL; // Fallback Sandbox (siempre al admin)
 
-        const emailSubject = isProductionDomainVerified
-            ? `Confirmación de Pedido - ETHERE4L`
-            : `[SANDBOX] Nuevo Pedido de ${cliente.nombre}`; // Subject claro para debug
+        if (!resend) {
+            console.warn(`⚠️ [${jobId}] Email skipped (Resend disabled)`);
+            return;
+        }
 
-        console.log(`✉️ [${jobId}] Enviando email a: ${recipient} (Modo: ${isProductionDomainVerified ? 'PROD' : 'SANDBOX'})`);
+        const isProductionDomainVerified = process.env.DOMAIN_VERIFIED === 'true';
 
-        const { data, error } = await resend.emails.send({
-            from: 'ETHERE4L <ventas@ethere4l.com>', // En Prod cambiar a: ventas@tudominio.com
-            to: [recipient], 
-            // Si estamos en Sandbox, agregamos Bcc al admin para asegurar que llegue
-            // Ojo: En Sandbox 'to' y 'bcc' deben ser correos verificados/propios.
-            subject: emailSubject,
-            html: generateEmailHTML(cliente, pedido), // Tu helper HTML
-            attachments: [{ filename: `Orden_${jobId}.pdf`, content: pdfBuffer }]
+        const recipient = isProductionDomainVerified
+            ? cliente.email
+            : process.env.ADMIN_EMAIL;
+
+        const subject = isProductionDomainVerified
+            ? 'Confirmación de Pedido - ETHERE4L'
+            : `[SANDBOX] Nuevo pedido - ${jobId}`;
+
+        console.log(`✉️ [${jobId}] Enviando email a ${recipient}`);
+
+        const { error } = await resend.emails.send({
+            from: 'ETHERE4L <ventas@ethere4l.com>',
+            to: [recipient],
+            subject,
+            html: generateEmailHTML(cliente, pedido, jobId),
+            attachments: [{
+                filename: `Orden_${jobId}.pdf`,
+                content: pdfBuffer
+            }]
         });
 
         if (error) {
-            // Log estructurado del error 403 u otros
-            console.error(`🛑 [${jobId}] Error Resend [${error.name}]: ${error.message}`);
-            // Aquí confirmamos que el PDF se generó pero falló el envío.
+            console.error(`🛑 [${jobId}] Email error: ${error.message}`);
+            console.warn(`💾 [${jobId}] Pedido backup:`, JSON.stringify({ cliente, pedido }));
         } else {
-            console.log(`🎉 [${jobId}] Email enviado. ID: ${data.id}`);
+            console.log(`🎉 [${jobId}] Email enviado correctamente`);
         }
-        if (error) {
-    console.error(`🛑 [${jobId}] FALLO ENVÍO EMAIL. ERROR: ${error.message}`);
-    // DUMP DE SEGURIDAD:
-    console.warn(`💾 [${jobId}] DATA BACKUP:`, JSON.stringify({ cliente, pedido }));
-}
 
     } catch (err) {
-        console.error(`🔥 [${jobId}] Crash en Worker:`, err);
+        console.error(`🔥 [${jobId}] Crash en worker:`, err);
     }
 }
 
-// --- 8. PDF HELPER ---
+// --- 9. PDF ---
 function generatePDF(cliente, pedido) {
     return new Promise((resolve, reject) => {
         const doc = new PDFDocument();
@@ -138,26 +160,15 @@ function generatePDF(cliente, pedido) {
         doc.on('end', () => resolve(Buffer.concat(buffers)));
         doc.on('error', reject);
 
-        doc.fontSize(20).text('ETHERE4L - Orden', { align: 'center' });
+        doc.fontSize(20).text('ETHERE4L - Orden de Compra', { align: 'center' });
         doc.moveDown();
-        doc.text(`Cliente: ${cliente.nombre}`);
+        doc.fontSize(12).text(`Cliente: ${cliente.nombre}`);
         doc.text(`Total: $${pedido.total}`);
-
         doc.end();
     });
 }
 
-app.get('/', (req, res) => {
-  res.status(200).json({
-    status: 'ok',
-    service: 'ETHERE4L backend',
-    uptime: process.uptime(),
-    timestamp: new Date().toISOString()
-  });
-});
-
-
-// --- 9. START SERVER ---
+// --- 10. START SERVER ---
 const server = app.listen(portToUse, '0.0.0.0', () => {
     console.log("==================================");
     console.log(`🟢 Server listening on ${portToUse}`);
@@ -165,8 +176,9 @@ const server = app.listen(portToUse, '0.0.0.0', () => {
     console.log("==================================");
 });
 
-// --- 10. GRACEFUL SHUTDOWN ---
+// --- 11. GRACEFUL SHUTDOWN ---
 process.on('SIGTERM', () => {
-    console.log('SIGTERM received. Shutting down...');
+    console.log('SIGTERM received. Closing server...');
     server.close(() => console.log('Server closed'));
 });
+
