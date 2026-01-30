@@ -15,6 +15,7 @@ const Database = require('better-sqlite3');
 const { Resend } = require('resend');
 
 // ✅ IMPORTACIONES CLAVE (CONECTAN CON TUS ARCHIVOS DE LUJO)
+// Esto reemplaza las funciones viejas que tenías abajo
 const { buildPDF } = require('./utils/pdfGenerator');
 const { getEmailTemplate, getPaymentConfirmedEmail } = require('./utils/emailTemplates');
 
@@ -36,7 +37,7 @@ let dbPersistent = false;
 
 try {
     console.log(`🔌 Conectando DB en: ${DB_PATH}`);
-    db = new Database(DB_PATH); // verbose quitado para limpiar logs
+    db = new Database(DB_PATH); 
     db.pragma('journal_mode = WAL'); // Optimización de escritura
 
     // Crear tabla si no existe
@@ -136,7 +137,7 @@ app.post('/api/crear-pedido', (req, res) => {
     });
 });
 
-// CONFIRMAR PAGO
+// CONFIRMAR PAGO (ENDPOINT PARA POSTMAN)
 app.post('/api/confirmar-pago', (req, res) => {
     const { jobId, paymentRef, confirmedBy } = req.body;
     
