@@ -1,6 +1,6 @@
 // =========================================================
 // PDF GENERATOR - ETHERE4L (CLIENTE / PROVEEDOR)
-// DEFINITIVE LUXURY VERSION
+// DEFINITIVE LUXURY VERSION - PRODUCTION READY
 // =========================================================
 const PDFDocument = require('pdfkit');
 const path = require('path');
@@ -8,25 +8,34 @@ const fs = require('fs');
 const QRCode = require('qrcode');
 const axios = require('axios');
 
+// 🌐 URL BASE DE TUS IMÁGENES (NETLIFY)
+// Esto es vital para convertir rutas relativas "/images/..." en URLs absolutas
+const FRONTEND_URL = 'https://ethereal-frontend.netlify.app';
 
 /* =======================
-   🆕 AGREGADO (NO BORRA)
+   🆕 AGREGADO: Helper robusto para descargar Buffers
    ======================= */
-
-
-/* =======================
-   🆕 AGREGADO (NO BORRA)
-   Función para renderizar imágenes desde URL HTTPS
-   ======================= */
-async function renderImageFromURL(doc, url, x, y, width) {
+async function fetchRemoteImageBuffer(url) {
   try {
-    const res = await axios.get(url, { responseType: 'arraybuffer' });
-    const buffer = Buffer.from(res.data);
-    doc.image(buffer, x, y, { width });
-    return true;
+    // Si la URL es relativa (empieza con /), le pegamos el dominio
+    let fullUrl = url;
+    if (!url.startsWith('http')) {
+       // Aseguramos que no haya dobles slashes //
+       const cleanPath = url.startsWith('/') ? url.substring(1) : url;
+       fullUrl = `${FRONTEND_URL}/${cleanPath}`;
+    }
+    
+    // console.log(`[PDF] Descargando imagen: ${fullUrl}`); // Descomentar para debug
+
+    const response = await axios.get(fullUrl, {
+      responseType: 'arraybuffer',
+      timeout: 5000 // Timeout de seguridad
+    });
+    
+    return Buffer.from(response.data, 'binary');
   } catch (err) {
-    console.warn('[PDF] Error cargando imagen remota:', url);
-    return false;
+    console.warn(`[PDF WARN] No se pudo descargar imagen: ${url}`);
+    return null;
   }
 }
 
@@ -34,6 +43,7 @@ async function buildPDF(cliente, pedido, jobId, type = 'CLIENTE') {
   return new Promise(async (resolve, reject) => {
     try {
       const ROOT = path.resolve(__dirname, '..');
+      // Intentamos buscar assets locales del backend (logo.png)
       const LOGO_PATH = path.join(ROOT, 'assets', 'branding', 'logo.png');
       const FONT_PATH = path.join(ROOT, 'fonts', 'static', 'Cinzel-Bold.ttf');
 
@@ -94,10 +104,11 @@ async function buildPDF(cliente, pedido, jobId, type = 'CLIENTE') {
       y += 15;
 
       const rows = [
-        ['Nombre', cliente.nombre],
+        ['Nombre', `${cliente.nombre} ${cliente.apellidos || ''}`], // Agregué apellidos si existen
         ['Email', cliente.email],
         ['Teléfono', cliente.telefono],
-        ['Dirección', cliente.direccion]
+        ['Dirección', `${cliente.calle || ''} ${cliente.numero_exterior || ''}, ${cliente.colonia || ''}`],
+        ['Ciudad', `${cliente.ciudad || ''}, ${cliente.estado || ''}, CP: ${cliente.cp || ''}`]
       ];
 
       rows.forEach((row, i) => {
@@ -110,6 +121,7 @@ async function buildPDF(cliente, pedido, jobId, type = 'CLIENTE') {
       });
 
       doc.moveDown(2);
+      y = doc.y + 20; // Ajuste de espacio
 
       // =====================================================
       // TABLA DE PRODUCTOS
@@ -117,7 +129,7 @@ async function buildPDF(cliente, pedido, jobId, type = 'CLIENTE') {
       doc.font('Helvetica-Bold').fontSize(11).fillColor(BLACK)
         .text('PRODUCTOS');
 
-      y = doc.y + 10;
+      y += 15;
 
       const cols = {
         img: 50,
@@ -145,56 +157,52 @@ async function buildPDF(cliente, pedido, jobId, type = 'CLIENTE') {
       y += 10;
       doc.font('Helvetica').fontSize(9).fillColor(GRAY);
 
+      // 🔄 ITERACIÓN DE PRODUCTOS
       for (const item of pedido.items) {
+        
+        // Control de salto de página manual si se acaba el espacio
+        if (y > 700) {
+            doc.addPage();
+            y = 50;
+        }
 
         // -----------------------------------------------------
-        // 🖼️ IMAGEN DE PRODUCTO (LOCAL O REMOTA)
+        // 🖼️ LÓGICA DE IMAGEN HÍBRIDA (La Solución)
         // -----------------------------------------------------
         const IMG_WIDTH = 40;
         const IMG_HEIGHT = 40;
         let imageRendered = false;
 
-if (Array.isArray(item.fotos) && item.fotos.length > 0) {
-  const localImagePath = path.join(
-    ROOT,
-    item.fotos[0]
-  );
+        // 1. Determinar la fuente de la imagen
+        // item.fotos suele ser un array, tomamos la primera. O item.image
+        let imageSource = null;
+        if (Array.isArray(item.fotos) && item.fotos.length > 0) imageSource = item.fotos[0];
+        else if (item.image) imageSource = item.image;
 
-  if (fs.existsSync(localImagePath)) {
-    try {
-      doc.image(localImagePath, cols.img, y, { width: IMG_WIDTH });
-      imageRendered = true;
-    } catch (err) {
-      console.warn('[PDF] Error renderizando imagen local:', localImagePath);
-    }
-  } else {
-    console.warn('[PDF] Imagen no encontrada:', localImagePath);
-  }
-}
+        // 2. Intentar cargar
+        if (imageSource) {
+            // A. Intento Local (Solo funcionará si tienes assets en Railway, poco probable para productos)
+            const localPath = path.join(ROOT, imageSource);
+            if (fs.existsSync(localPath)) {
+                try {
+                    doc.image(localPath, cols.img, y, { width: IMG_WIDTH, height: IMG_HEIGHT, fit: [IMG_WIDTH, IMG_HEIGHT] });
+                    imageRendered = true;
+                } catch(e) {}
+            }
 
+            // B. Intento Remoto (La clave para producción)
+            if (!imageRendered) {
+                const buffer = await fetchRemoteImageBuffer(imageSource);
+                if (buffer) {
+                    try {
+                        doc.image(buffer, cols.img, y, { width: IMG_WIDTH, height: IMG_HEIGHT, fit: [IMG_WIDTH, IMG_HEIGHT] });
+                        imageRendered = true;
+                    } catch (e) { console.warn('Buffer de imagen corrupto o formato no soportado'); }
+                }
+            }
+        }
 
-// 🌐 Fallback HTTPS (Railway / Producción)
-if (!imageRendered && item.image) {
-  try {
-    const response = await axios.get(item.image, {
-      responseType: 'arraybuffer',
-      timeout: 8000
-    });
-
-    const imgBuffer = Buffer.from(response.data, 'binary');
-
-    doc.image(imgBuffer, cols.img, y, {
-      width: IMG_WIDTH
-    });
-
-    imageRendered = true;
-  } catch (err) {
-    console.warn('[PDF] Error cargando imagen HTTPS:', item.image);
-  }
-}
-
-
-        // === PLACEHOLDER ORIGINAL ===
+        // === PLACEHOLDER (Si todo falla) ===
         if (!imageRendered) {
           doc.rect(cols.img, y, IMG_WIDTH, IMG_HEIGHT)
             .strokeColor('#CCCCCC')
@@ -204,24 +212,24 @@ if (!imageRendered && item.image) {
           doc.font('Helvetica')
             .fontSize(8)
             .fillColor('#999999')
-            .text(
-              'IMG',
-              cols.img,
-              y + IMG_HEIGHT / 2 - 4,
-              { width: IMG_WIDTH, align: 'center' }
-            );
+            .text('IMG', cols.img, y + IMG_HEIGHT / 2 - 4, { width: IMG_WIDTH, align: 'center' });
         }
 
-        doc.text(item.nombre, cols.name, y, { width: 170 });
-        doc.text(item.talla, cols.size, y);
-        doc.text(item.cantidad, cols.qty, y);
+        // Reset color y fuente para texto
+        doc.fillColor(GRAY).font('Helvetica');
+
+        // Textos alineados verticalmente a la imagen
+        const textY = y + 10;
+        doc.text(item.nombre, cols.name, textY, { width: 170 });
+        doc.text(item.talla || 'U', cols.size, textY);
+        doc.text(item.cantidad, cols.qty, textY);
 
         if (type === 'CLIENTE') {
-          doc.text(`$${item.precio}`, cols.price, y);
-          doc.text(`$${item.precio * item.cantidad}`, cols.total, y);
+          doc.text(`$${item.precio}`, cols.price, textY);
+          doc.text(`$${item.precio * item.cantidad}`, cols.total, textY);
         }
 
-        y += 55;
+        y += 55; // Espacio por fila
       }
 
       doc.moveDown(2);
@@ -230,12 +238,13 @@ if (!imageRendered && item.image) {
       // TOTAL A PAGAR (DESTACADO)
       // =====================================================
       if (type === 'CLIENTE') {
-        doc.rect(300, y, 250, 70).fill('#000000');
+        const totalBoxY = y;
+        doc.rect(300, totalBoxY, 250, 70).fill('#000000');
         doc.fillColor('#FFFFFF').font('Helvetica-Bold').fontSize(12)
-          .text('TOTAL A PAGAR', 300, y + 15, { align: 'center', width: 250 });
+          .text('TOTAL A PAGAR', 300, totalBoxY + 15, { align: 'center', width: 250 });
 
         doc.fontSize(18)
-          .text(`$${pedido.total.toLocaleString('es-MX')} MXN`, 300, y + 35, {
+          .text(`$${pedido.total.toLocaleString('es-MX')} MXN`, 300, totalBoxY + 35, {
             align: 'center',
             width: 250
           });
@@ -248,17 +257,18 @@ if (!imageRendered && item.image) {
       // =====================================================
       if (type === 'CLIENTE') {
         doc.font('Helvetica-Bold').fontSize(11).fillColor(BLACK)
-          .text('DATOS PARA TRANSFERENCIA');
+          .text('DATOS PARA TRANSFERENCIA', 50, y);
 
+        // QR GENERATOR
         const qrData = `ETHERE4L|${jobId}|MXN|${pedido.total}`;
         const qr = await QRCode.toDataURL(qrData);
 
-        doc.image(qr, 50, y + 10, { width: 90 });
+        doc.image(qr, 50, y + 15, { width: 90 });
 
         doc.font('Helvetica').fontSize(9).fillColor(GRAY);
-        doc.text('BANCO: BBVA', 160, y + 20);
-        doc.text('CLABE: 0123 4567 8901 2345 67', 160, y + 35);
-        doc.text(`CONCEPTO: ${jobId}`, 160, y + 50);
+        doc.text('BANCO:', 160, y + 25).font('Helvetica-Bold').text('BBVA', 220, y + 25);
+        doc.font('Helvetica').text('CLABE:', 160, y + 40).font('Helvetica-Bold').text('0123 4567 8901 2345 67', 220, y + 40);
+        doc.font('Helvetica').text('CONCEPTO:', 160, y + 55).fillColor('#FF0000').font('Helvetica-Bold').text(jobId, 220, y + 55);
       }
 
       // =====================================================
@@ -266,7 +276,7 @@ if (!imageRendered && item.image) {
       // =====================================================
       doc.fontSize(8).fillColor(GRAY)
         .text('ETHERE4L • STREETWEAR & HIGH FASHION', 50, 760, {
-          align: 'center'
+          align: 'center', width: 500
         });
 
       doc.end();

@@ -2,15 +2,15 @@
 // EMAIL TEMPLATES - ETHERE4L (PURE HTML)
 // =========================================================
 
-// URL pública ABSOLUTA SERVIDA DESDE BACKEND (Gmail-safe)
-const LOGO_URL =
-  "https://ethereal-backend-production-6060.up.railway.app/static/email/logo-email.png";
+// ✅ CAMBIO CRÍTICO: Usamos el CDN de Netlify para garantizar que Gmail cargue la imagen
+// Asegúrate de que esta ruta exista en tu frontend (public/images/ui/header-logo.png)
+const LOGO_URL = "https://ethereal-frontend.netlify.app/images/ui/header-logo.png";
 
 const styles = {
     container: "margin:0;padding:0;width:100%;background-color:#f8f8f8;font-family:Helvetica,Arial,sans-serif;",
     wrapper: "max-width:600px;margin:20px auto;background:#ffffff;border-radius:8px;overflow:hidden;border:1px solid #eeeeee;",
     header: "background:#000000;padding:30px 20px;text-align:center;",
-    logo: "display:block;width:150px;max-width:150px;height:auto;margin:0 auto;",
+    logo: "display:block;width:150px;max-width:150px;height:auto;margin:0 auto;border:0;",
     content: "padding:40px 30px;color:#333333;line-height:1.6;",
     h1: "font-size:18px;font-weight:bold;margin:0 0 20px 0;color:#000000;text-align:center;text-transform:uppercase;",
     p: "font-size:15px;margin-bottom:15px;color:#555555;",
