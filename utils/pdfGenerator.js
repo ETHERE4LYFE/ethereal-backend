@@ -6,11 +6,13 @@ const PDFDocument = require('pdfkit');
 const path = require('path');
 const fs = require('fs');
 const QRCode = require('qrcode');
+const axios = require('axios');
+
 
 /* =======================
    🆕 AGREGADO (NO BORRA)
    ======================= */
-const axios = require('axios');
+
 
 /* =======================
    🆕 AGREGADO (NO BORRA)
@@ -152,30 +154,45 @@ async function buildPDF(cliente, pedido, jobId, type = 'CLIENTE') {
         const IMG_HEIGHT = 40;
         let imageRendered = false;
 
-        // === LÓGICA ORIGINAL (NO BORRADA) ===
-        if (Array.isArray(item.fotos) && item.fotos.length > 0) {
-          const localImagePath = path.join(ROOT, item.fotos[0]);
+if (Array.isArray(item.fotos) && item.fotos.length > 0) {
+  const localImagePath = path.join(
+    ROOT,
+    item.fotos[0]
+  );
 
-          if (fs.existsSync(localImagePath)) {
-            try {
-              doc.image(localImagePath, cols.img, y, { width: IMG_WIDTH });
-              imageRendered = true;
-            } catch (err) {
-              console.warn('[PDF] Error renderizando imagen local:', localImagePath);
-            }
-          }
-        }
+  if (fs.existsSync(localImagePath)) {
+    try {
+      doc.image(localImagePath, cols.img, y, { width: IMG_WIDTH });
+      imageRendered = true;
+    } catch (err) {
+      console.warn('[PDF] Error renderizando imagen local:', localImagePath);
+    }
+  } else {
+    console.warn('[PDF] Imagen no encontrada:', localImagePath);
+  }
+}
 
-        // === 🆕 FALLBACK A URL HTTPS (AGREGADO) ===
-        if (!imageRendered && Array.isArray(item.fotos) && item.fotos[0]) {
-          imageRendered = await renderImageFromURL(
-            doc,
-            item.fotos[0],
-            cols.img,
-            y,
-            IMG_WIDTH
-          );
-        }
+
+// 🌐 Fallback HTTPS (Railway / Producción)
+if (!imageRendered && item.image) {
+  try {
+    const response = await axios.get(item.image, {
+      responseType: 'arraybuffer',
+      timeout: 8000
+    });
+
+    const imgBuffer = Buffer.from(response.data, 'binary');
+
+    doc.image(imgBuffer, cols.img, y, {
+      width: IMG_WIDTH
+    });
+
+    imageRendered = true;
+  } catch (err) {
+    console.warn('[PDF] Error cargando imagen HTTPS:', item.image);
+  }
+}
+
 
         // === PLACEHOLDER ORIGINAL ===
         if (!imageRendered) {
