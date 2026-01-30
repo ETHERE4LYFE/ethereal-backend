@@ -1,230 +1,213 @@
-// ===============================
-// ETHERE4L BACKEND – RAILWAY SAFE
-// ===============================
+// =========================================================
+// SERVER.JS - ETHERE4L BACKEND (FINAL PRODUCTION)
+// =========================================================
 
-// dotenv SOLO en local
-if (process.env.NODE_ENV !== 'production') {
-    require('dotenv').config();
-}
+require('dotenv').config();
 
+const fs = require('fs');
+const path = require('path');
 const express = require('express');
 const cors = require('cors');
-const PDFDocument = require('pdfkit');
+const Database = require('better-sqlite3');
 const { Resend } = require('resend');
 
-// --- 1. APP ---
+// ✅ IMPORTANTE: Conectamos con tus archivos de lujo
+const { buildPDF } = require('./utils/pdfGenerator');
+const { getEmailTemplate, getPaymentConfirmedEmail } = require('./utils/emailTemplates');
+
+// ===============================
+// 1. DATABASE SETUP (PERSISTENCIA)
+// ===============================
+const RAILWAY_VOLUME = '/app/data';
+const isRailway = fs.existsSync(RAILWAY_VOLUME);
+const DATA_DIR = isRailway ? RAILWAY_VOLUME : path.join(__dirname, 'data');
+const DB_PATH = path.join(DATA_DIR, 'orders.db');
+
+if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+}
+
+let db;
+let dbPersistent = false;
+
+try {
+    db = new Database(DB_PATH, { verbose: console.log });
+    db.pragma('journal_mode = WAL');
+
+    db.exec(`
+        CREATE TABLE IF NOT EXISTS pedidos (
+            id TEXT PRIMARY KEY,
+            email TEXT,
+            data TEXT,
+            status TEXT DEFAULT 'PENDIENTE',
+            payment_ref TEXT,
+            confirmed_by TEXT,
+            paid_at DATETIME,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    `);
+
+    dbPersistent = true;
+    console.log(`✅ DB Conectada en: ${DB_PATH}`);
+} catch (err) {
+    console.error('❌ DB ERROR → SAFE MODE ACTIVO', err);
+    db = {
+        prepare: () => ({ run: () => {}, get: () => null, all: () => [] }),
+        exec: () => {}
+    };
+}
+
+// ===============================
+// 2. APP CONFIG
+// ===============================
 const app = express();
+const PORT = process.env.PORT || 3000;
 
-// --- 2. PUERTO (SANITIZADO TOTAL) ---
-let portToUse = 3000;
-const rawPort = process.env.PORT;
+// Configuración CORS para Netlify
+app.use(cors({
+    origin: [
+        'https://ethereal-frontend.netlify.app',
+        'http://localhost:5500'
+    ],
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type']
+}));
 
-if (rawPort) {
-    const parsedPort = parseInt(rawPort, 10);
-    if (!isNaN(parsedPort) && parsedPort > 0 && parsedPort <= 65535) {
-        portToUse = parsedPort;
-        console.log(`✅ Using Railway PORT: ${portToUse}`);
-    } else {
-        console.warn(`⚠️ Invalid PORT received ("${rawPort}"). Using 3000`);
-    }
-} else {
-    console.warn("⚠️ No PORT provided. Using 3000");
-}
-
-// --- 3. RESEND (GRACEFUL INIT) ---
-let resend = null;
-
-if (process.env.RESEND_API_KEY && process.env.RESEND_API_KEY.trim() !== "") {
-    try {
-        resend = new Resend(process.env.RESEND_API_KEY.trim());
-        console.log("✅ Resend initialized");
-    } catch (err) {
-        console.error("❌ Failed to initialize Resend:", err.message);
-    }
-} else {
-    console.warn("⚠️ RESEND_API_KEY missing. Email disabled.");
-}
-
-// --- 4. MIDDLEWARES ---
-app.use(cors());
 app.use(express.json());
 
-// --- 5. HEALTH CHECK ---
+// Resend Config
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'ethere4lyfe@gmail.com';
+const SENDER_EMAIL = 'orders@ethere4l.com'; // Tu dominio verificado
+const resend = new Resend(RESEND_API_KEY);
+
+// ===============================
+// 3. API ENDPOINTS
+// ===============================
+
+// Health Check
 app.get('/', (req, res) => {
-    res.status(200).json({
-        status: 'ok',
-        service: 'ETHERE4L backend',
-        uptime: process.uptime(),
-        timestamp: new Date().toISOString()
+    res.json({
+        status: 'online',
+        service: 'ETHERE4L Backend',
+        version: 'Production Gold',
+        db: dbPersistent ? 'PERSISTENT' : 'MEMORY_ONLY'
     });
 });
 
-// --- 6. API ---
+// CREAR PEDIDO
 app.post('/api/crear-pedido', (req, res) => {
     const { cliente, pedido } = req.body;
 
-    if (!cliente || !pedido || !Array.isArray(pedido.items)) {
-        console.warn("⚠️ Invalid payload");
-        return res.status(400).json({ success: false, message: "Datos incompletos" });
+    if (!cliente || !pedido) {
+        return res.status(400).json({ success: false, message: 'Datos incompletos' });
     }
 
-    const jobId = `JOB-${Date.now().toString().slice(-6)}`;
+    const jobId = `ORD-${Date.now().toString().slice(-6)}`;
 
-    res.json({
-        success: true,
+    // Respuesta rápida al frontend
+    res.json({ 
+        success: true, 
         jobId,
-        message: "Pedido recibido. Procesando en segundo plano."
+        message: "Pedido procesado correctamente"
     });
 
-    console.log(`🚀 [${jobId}] Pedido recibido`);
-
+    // Procesar en background
     setImmediate(() => {
-        runBackgroundTask(jobId, cliente, pedido)
-            .catch(err => console.error(`❌ [${jobId}] Background error:`, err));
+        processOrder(jobId, cliente, pedido)
+            .catch(err => console.error(`❌ Error en Job ${jobId}:`, err));
     });
 });
 
-// --- 7. EMAIL HTML ---
-function generateEmailHTML(cliente, pedido, jobId, isAdmin = false) {
-    return `
-    <div style="font-family: Arial, Helvetica, sans-serif; background:#f4f4f4; padding:20px;">
-      <div style="max-width:600px; margin:auto; background:#ffffff; border-radius:8px; overflow:hidden;">
-        
-        <!-- HEADER -->
-        <div style="background:#000; padding:20px; text-align:center;">
-          <img src="https://ethere4l.com/assets/logo-email.png" alt="ETHERE4L" style="max-width:160px;" />
-        </div>
+// CONFIRMAR PAGO
+app.post('/api/confirmar-pago', (req, res) => {
+    const { jobId, paymentRef, confirmedBy } = req.body;
+    
+    if (!jobId) return res.status(400).json({ error: 'jobId requerido' });
 
-        <!-- BODY -->
-        <div style="padding:24px;">
-          <h2 style="margin-top:0;">${isAdmin ? '🚨 Nuevo pedido recibido' : '🛍️ Pedido confirmado'}</h2>
+    res.json({ success: true, message: 'Confirmación iniciada' });
 
-          <p><strong>ID de pedido:</strong> ${jobId}</p>
-          <p><strong>Cliente:</strong> ${cliente.nombre || 'No especificado'}</p>
-          <p><strong>Email:</strong> ${cliente.email || 'No proporcionado'}</p>
+    setImmediate(async () => {
+        try {
+            if (!dbPersistent) return;
 
-          <hr />
+            // Actualizar DB
+            const info = db.prepare(`
+                UPDATE pedidos 
+                SET status='PAGADO', paid_at=datetime('now'), payment_ref=?, confirmed_by=?
+                WHERE id=?
+            `).run(paymentRef || 'MANUAL', confirmedBy || 'Admin', jobId);
 
-          <h3>Resumen del pedido</h3>
-          <ul>
-            ${pedido.items.map(item => `
-              <li>
-                ${item.nombre} — Talla: ${item.talla || 'N/A'} × ${item.cantidad}
-              </li>
-            `).join('')}
-          </ul>
-
-          <p><strong>Total:</strong> $${pedido.total}</p>
-
-          <p style="margin-top:20px;">
-            📎 Se adjunta el PDF con el detalle completo de la orden.
-          </p>
-
-          ${!isAdmin ? `
-          <p style="margin-top:20px;">
-            Si tienes dudas, contáctanos por WhatsApp o Instagram.
-          </p>
-          ` : ''}
-
-        </div>
-
-        <!-- FOOTER -->
-        <div style="background:#fafafa; padding:16px; text-align:center; font-size:12px; color:#555;">
-          ETHERE4L © ${new Date().getFullYear()}<br/>
-          <a href="https://ethere4l.com" style="color:#000;">ethere4l.com</a>
-        </div>
-
-      </div>
-    </div>
-    `;
-}
-
-
-// --- 8. BACKGROUND TASK ---
-async function runBackgroundTask(jobId, cliente, pedido) {
-    try {
-        console.log(`⚙️ [${jobId}] Generando PDF...`);
-        const pdfBuffer = await generatePDF(cliente, pedido);
-
-        if (!resend) {
-            console.warn(`⚠️ [${jobId}] Email skipped (Resend disabled)`);
-            return;
+            if (info.changes > 0) {
+                // Enviar correo de confirmación
+                const row = db.prepare("SELECT * FROM pedidos WHERE id=?").get(jobId);
+                const { cliente, pedido } = JSON.parse(row.data);
+                
+                await resend.emails.send({
+                    from: `ETHERE4L <${SENDER_EMAIL}>`,
+                    to: [cliente.email],
+                    subject: `Pago Confirmado – ${jobId}`,
+                    html: getPaymentConfirmedEmail(cliente, pedido, jobId)
+                });
+                console.log(`💰 Pago confirmado para ${jobId}`);
+            }
+        } catch (e) {
+            console.error("Error confirmando pago:", e);
         }
+    });
+});
 
-        const fromAddress = 'ETHERE4L Orders <orders@ethere4l.com>';
+// ===============================
+// 4. BACKGROUND WORKER (MAGIA AQUÍ)
+// ===============================
+async function processOrder(jobId, cliente, pedido) {
+    console.log(`⚙️ Procesando pedido ${jobId}...`);
 
-        /* =====================
-           1️⃣ EMAIL AL ADMIN (SIEMPRE)
-        ===================== */
-        console.log(`✉️ [${jobId}] Enviando email al ADMIN`);
+    // 1. Guardar en DB
+    if (dbPersistent) {
+        try {
+            db.prepare(`
+                INSERT INTO pedidos (id, email, data, status) VALUES (?, ?, ?, 'PENDIENTE')
+            `).run(jobId, cliente.email, JSON.stringify({ cliente, pedido }));
+        } catch (e) { console.error('Error guardando DB:', e); }
+    }
 
+    // 2. Generar PDFs (USANDO EL GENERADOR DE LUJO)
+    // Aquí es donde llamamos al archivo utils/pdfGenerator.js
+    const pdfBuffer = await buildPDF(cliente, pedido, jobId, 'CLIENTE');
+    
+    // (Opcional) PDF Proveedor si lo necesitas diferente
+    // const pdfProveedor = await buildPDF(cliente, pedido, jobId, 'PROVEEDOR');
+
+    // 3. Enviar Emails
+    if (RESEND_API_KEY) {
+        
+        // Email Cliente
         await resend.emails.send({
-            from: fromAddress,
-            to: [process.env.ADMIN_EMAIL],
-            subject: '🚨 Nuevo pedido recibido – ETHERE4L',
-            html: generateEmailHTML(cliente, pedido, jobId, true),
-            attachments: [{
-                filename: `Orden_${jobId}.pdf`,
-                content: pdfBuffer
-            }]
+            from: `ETHERE4L <${SENDER_EMAIL}>`,
+            to: [cliente.email],
+            subject: `Orden Recibida ${jobId}`,
+            html: getEmailTemplate(cliente, pedido, jobId, false),
+            attachments: [{ filename: `Orden_${jobId}.pdf`, content: pdfBuffer }]
         });
 
-        /* =====================
-           2️⃣ EMAIL AL CLIENTE (SI EXISTE)
-        ===================== */
-        if (cliente.email && cliente.email.includes('@')) {
-            console.log(`✉️ [${jobId}] Enviando email al CLIENTE: ${cliente.email}`);
-
+        // Email Admin
+        if (ADMIN_EMAIL) {
             await resend.emails.send({
-                from: fromAddress,
-                to: [cliente.email],
-                subject: '🛍️ Tu pedido en ETHERE4L fue recibido',
-                html: generateEmailHTML(cliente, pedido, jobId, false),
-                attachments: [{
-                    filename: `Orden_${jobId}.pdf`,
-                    content: pdfBuffer
-                }]
+                from: `ETHERE4L System <${SENDER_EMAIL}>`,
+                to: [ADMIN_EMAIL],
+                subject: `🚨 NUEVA VENTA ${jobId}`,
+                html: getEmailTemplate(cliente, pedido, jobId, true),
+                attachments: [{ filename: `Orden_${jobId}.pdf`, content: pdfBuffer }]
             });
-        } else {
-            console.warn(`⚠️ [${jobId}] Cliente sin email, solo admin notificado`);
         }
-
-        console.log(`🎉 [${jobId}] Emails enviados correctamente`);
-
-    } catch (err) {
-        console.error(`🔥 [${jobId}] Crash en worker:`, err);
-        console.warn(`💾 [${jobId}] Pedido backup:`, JSON.stringify({ cliente, pedido }));
+        console.log(`✅ Emails enviados para ${jobId}`);
     }
 }
 
-// --- 9. PDF ---
-function generatePDF(cliente, pedido) {
-    return new Promise((resolve, reject) => {
-        const doc = new PDFDocument();
-        const buffers = [];
-
-        doc.on('data', buffers.push.bind(buffers));
-        doc.on('end', () => resolve(Buffer.concat(buffers)));
-        doc.on('error', reject);
-
-        doc.fontSize(20).text('ETHERE4L - Orden de Compra', { align: 'center' });
-        doc.moveDown();
-        doc.fontSize(12).text(`Cliente: ${cliente.nombre}`);
-        doc.text(`Total: $${pedido.total}`);
-        doc.end();
-    });
-}
-
-// --- 10. START SERVER ---
-const server = app.listen(portToUse, '0.0.0.0', () => {
-    console.log("==================================");
-    console.log(`🟢 Server listening on ${portToUse}`);
-    console.log(`📧 Email system: ${resend ? 'ACTIVE' : 'DISABLED'}`);
-    console.log("==================================");
-});
-
-// --- 11. GRACEFUL SHUTDOWN ---
-process.on('SIGTERM', () => {
-    console.log('SIGTERM received. Closing server...');
-    server.close(() => console.log('Server closed'));
+// ===============================
+// START
+// ===============================
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`🚀 ETHERE4L Backend GOLD corriendo en puerto ${PORT}`);
 });
