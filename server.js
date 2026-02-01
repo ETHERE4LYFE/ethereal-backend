@@ -118,6 +118,12 @@ try {
 // 2. CONFIGURACIÓN APP & RESEND
 // ===============================
 const app = express();
+/* ===============================
+   FIX CRÍTICO RAILWAY + RATE LIMIT
+   =============================== */
+app.set('trust proxy', 1);
+
+
 const PORT = process.env.PORT || 3000;
 
 // Rate Limiter para Admin (Protección fuerza bruta)
@@ -356,13 +362,44 @@ app.post('/api/crear-pedido', (req, res) => {
 
 // Login Admin (JWT)
 app.post('/api/admin/login', adminLimiter, async (req, res) => {
-    const { password } = req.body;
-    if (ADMIN_PASS_HASH && await bcrypt.compare(password, ADMIN_PASS_HASH)) {
-        const token = jwt.sign({ role: 'admin' }, JWT_SECRET, { expiresIn: '4h' });
+    try {
+        const { password } = req.body;
+
+        // LOG CLAVE: confirma que el request YA NO MUERE en rate-limit
+        console.log(`🔐 Admin login attempt | IP: ${req.ip}`);
+
+        if (!process.env.ADMIN_PASS_HASH || !process.env.JWT_SECRET) {
+            console.error("❌ Faltan ADMIN_PASS_HASH o JWT_SECRET en Railway");
+            return res.status(500).json({ error: 'Server misconfigured' });
+        }
+
+        // LIMPIEZA CRÍTICA (evita espacios invisibles)
+        const cleanPassword = String(password || '').trim();
+        const cleanHash = String(process.env.ADMIN_PASS_HASH).trim();
+
+        const match = await bcrypt.compare(cleanPassword, cleanHash);
+
+        if (!match) {
+            console.warn("⛔ Password incorrecto");
+            return res.status(401).json({ error: 'Credenciales inválidas' });
+        }
+
+        console.log("✅ Login correcto, generando JWT");
+
+        const token = jwt.sign(
+            { role: 'admin' },
+            process.env.JWT_SECRET,
+            { expiresIn: '4h' }
+        );
+
         return res.json({ success: true, token });
+
+    } catch (err) {
+        console.error("💥 Error login admin:", err);
+        return res.status(500).json({ error: 'Login error' });
     }
-    res.status(401).json({ error: 'Acceso Denegado' });
 });
+
 
 // Obtener Órdenes (Protegido)
 app.get('/api/admin/orders', verifyToken, (req, res) => {
