@@ -186,12 +186,15 @@ app.get('/', (req, res) => {
     res.json({ status: 'online', service: 'ETHERE4L Backend v2.0', mode: 'Stripe Enabled' });
 });
 
-// --- NUEVO: CREAR SESIÓN DE PAGO (Calcula envío por peso) ---
+// --- NUEVO: CREAR SESIÓN DE PAGO (CORREGIDO ERR_INVALID_CHAR) ---
 app.post('/api/create-checkout-session', async (req, res) => {
     try {
-        // 1. Recibimos ITEMS y CUSTOMER (Datos del formulario)
         const { items, customer } = req.body;
         
+        // 1. DEFINICIÓN SEGURA DEL DOMINIO (Solución CRÍTICA al error 500)
+        // Definimos una URL base sólida. Si req.headers.origin falla, usamos el dominio hardcoded.
+        const FRONTEND_URL = process.env.FRONTEND_URL || req.headers.origin || 'https://ethereal-frontend.netlify.app';
+
         let lineItems = [];
         let pesoTotal = 0;
 
@@ -204,16 +207,25 @@ app.post('/api/create-checkout-session', async (req, res) => {
 
             const productFinal = dbProduct || item;
             
-            // Lógica de peso
+            // Sanitización de peso
             const pesoUnitario = parseFloat(productFinal.peso || 0.6);
             pesoTotal += pesoUnitario * item.cantidad;
+
+            // Sanitización de imágenes (Stripe falla si la URL es relativa o vacía)
+            let productImages = [];
+            if (productFinal.fotos && productFinal.fotos.length > 0) {
+                const img = productFinal.fotos[0];
+                if (img.startsWith('http')) { // Solo enviar si es URL absoluta válida
+                    productImages.push(img);
+                }
+            }
 
             lineItems.push({
                 price_data: {
                     currency: 'mxn',
                     product_data: {
                         name: productFinal.nombre,
-                        images: productFinal.fotos ? [productFinal.fotos[0]] : [],
+                        images: productImages, // Array limpio
                         metadata: {
                             talla: item.talla,
                             id_producto: item.id
@@ -232,26 +244,25 @@ app.post('/api/create-checkout-session', async (req, res) => {
         else if (pesoTotal <= 5.0) costoEnvio = 950; // MXN
         else costoEnvio = 1500;                      // MXN Heavy Haul
 
-        // 4. Preparar Metadata (Para el Webhook)
-        // Guardamos los datos completos del formulario para no perder 'notas', 'colonia', etc.
+        // 4. Preparar Metadata (Sanitizada para evitar overflow)
         const metadata = {
-            customer_cart: JSON.stringify(items.map(i => ({id: i.id, t: i.talla, q: i.cantidad}))),
+            customer_cart_summary: JSON.stringify(items.map(i => `${i.id}(${i.cantidad})`)).substring(0, 500)
         };
 
-        // Intentamos guardar info del cliente en metadata (Cuidado con límite 500chars de Stripe)
-        // Si es muy largo, solo guardamos lo esencial, pero idealmente guardamos todo.
         if (customer) {
+            // Guardamos info esencial, sanitizando para evitar overflow o char invalidos
+            metadata.customer_email = customer.email || '';
+            
             try {
                 // Serializamos solo lo necesario si el objeto es muy grande, o todo si cabe
                 const customerString = JSON.stringify(customer);
-                if (customerString.length < 500) {
+                if (customerString.length < 450) {
                     metadata.customer_info = customerString;
                 } else {
                     // Fallback simplificado si excede
                     metadata.customer_info = JSON.stringify({
                         nombre: customer.nombre,
-                        email: customer.email,
-                        notas: customer.notas
+                        email: customer.email
                     });
                 }
             } catch (e) {
@@ -279,16 +290,18 @@ app.post('/api/create-checkout-session', async (req, res) => {
                     },
                 },
             ],
-            success_url: `${req.headers.origin}/success.html`,
-            cancel_url: `${req.headers.origin}/pedido.html`,
+            // Usamos la URL Segura calculada al inicio
+            success_url: `${FRONTEND_URL}/success.html`,
+            cancel_url: `${FRONTEND_URL}/pedido.html`,
             metadata: metadata
         });
 
         res.json({ url: session.url });
 
     } catch (e) {
-        console.error("Error Stripe Checkout:", e);
-        res.status(500).json({ error: "Error creando sesión de pago" });
+        console.error("❌ Error Stripe Checkout:", e);
+        // Devolvemos JSON incluso en error para que el frontend lo muestre
+        res.status(500).json({ error: "Error creando sesión de pago: " + e.message });
     }
 });
 
@@ -383,7 +396,7 @@ app.post('/api/admin/update-tracking', verifyToken, async (req, res) => {
 async function handleStripeSuccess(session) {
     const jobId = session.id; 
     const email = session.customer_details.email; // Email confirmado por Stripe
-    const itemsShort = JSON.parse(session.metadata.customer_cart || '[]');
+    const itemsShort = JSON.parse(session.metadata.customer_cart_summary || '[]'); // Fallback a empty array si falla
     
     // 1. RECONSTRUCCIÓN INTELIGENTE DEL CLIENTE
     // Intentamos usar los datos ricos del formulario (Metadata)
