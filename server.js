@@ -189,14 +189,15 @@ app.get('/', (req, res) => {
 // --- NUEVO: CREAR SESIÓN DE PAGO (Calcula envío por peso) ---
 app.post('/api/create-checkout-session', async (req, res) => {
     try {
-        const { items } = req.body;
+        // 1. Recibimos ITEMS y CUSTOMER (Datos del formulario)
+        const { items, customer } = req.body;
+        
         let lineItems = [];
         let pesoTotal = 0;
 
-        // 1. Reconstruir orden segura (Validar precios vs JSON servidor)
+        // 2. Reconstruir orden segura (Validar precios vs JSON servidor)
         for (const item of items) {
             // Buscamos el producto en la DB local del servidor para asegurar precio real
-            // Si no hay DB cargada, usamos el precio que viene (INSEGURO, solo fallback)
             const dbProduct = PRODUCTS_DB.length > 0 
                 ? PRODUCTS_DB.find(p => String(p.id) === String(item.id)) 
                 : { ...item, peso: item.peso || 0.6 }; 
@@ -224,18 +225,47 @@ app.post('/api/create-checkout-session', async (req, res) => {
             });
         }
 
-        // 2. Calcular Envío Logístico
+        // 3. Calcular Envío Logístico
         let costoEnvio = 0;
         if (pesoTotal <= 1.0) costoEnvio = 350;      // MXN
         else if (pesoTotal <= 3.0) costoEnvio = 650; // MXN
         else if (pesoTotal <= 5.0) costoEnvio = 950; // MXN
         else costoEnvio = 1500;                      // MXN Heavy Haul
 
-        // 3. Crear Sesión Stripe
+        // 4. Preparar Metadata (Para el Webhook)
+        // Guardamos los datos completos del formulario para no perder 'notas', 'colonia', etc.
+        const metadata = {
+            customer_cart: JSON.stringify(items.map(i => ({id: i.id, t: i.talla, q: i.cantidad}))),
+        };
+
+        // Intentamos guardar info del cliente en metadata (Cuidado con límite 500chars de Stripe)
+        // Si es muy largo, solo guardamos lo esencial, pero idealmente guardamos todo.
+        if (customer) {
+            try {
+                // Serializamos solo lo necesario si el objeto es muy grande, o todo si cabe
+                const customerString = JSON.stringify(customer);
+                if (customerString.length < 500) {
+                    metadata.customer_info = customerString;
+                } else {
+                    // Fallback simplificado si excede
+                    metadata.customer_info = JSON.stringify({
+                        nombre: customer.nombre,
+                        email: customer.email,
+                        notas: customer.notas
+                    });
+                }
+            } catch (e) {
+                console.warn("Error serializando metadata cliente", e);
+            }
+        }
+
+        // 5. Crear Sesión Stripe
         const session = await stripe.checkout.sessions.create({
             payment_method_types: ['card'],
             line_items: lineItems,
             mode: 'payment',
+            // Pre-llenar email para mejorar UX
+            customer_email: customer?.email, 
             shipping_options: [
                 {
                     shipping_rate_data: {
@@ -249,13 +279,9 @@ app.post('/api/create-checkout-session', async (req, res) => {
                     },
                 },
             ],
-            // Ajustar URLs de éxito/cancelación
             success_url: `${req.headers.origin}/success.html`,
             cancel_url: `${req.headers.origin}/pedido.html`,
-            metadata: {
-                // Guardamos resumen del carrito para reconstruir orden en webhook
-                customer_cart: JSON.stringify(items.map(i => ({id: i.id, t: i.talla, q: i.cantidad})))
-            }
+            metadata: metadata
         });
 
         res.json({ url: session.url });
@@ -319,7 +345,7 @@ app.post('/api/admin/update-tracking', verifyToken, async (req, res) => {
         if (info.changes > 0) {
             // Recuperar datos para email
             const order = db.prepare("SELECT * FROM pedidos WHERE id=?").get(orderId);
-            const orderData = JSON.parse(order.data);
+            const orderData = JSON.parse(order.data); // No se usa directamente pero valida integridad
 
             // Enviar correo de tracking
             if (resend) {
@@ -355,22 +381,36 @@ app.post('/api/admin/update-tracking', verifyToken, async (req, res) => {
 
 // Manejo post-pago de Stripe
 async function handleStripeSuccess(session) {
-    const jobId = session.id; // Usamos ID de sesión como ID de orden temporal o generamos uno propio
-    const email = session.customer_details.email;
+    const jobId = session.id; 
+    const email = session.customer_details.email; // Email confirmado por Stripe
     const itemsShort = JSON.parse(session.metadata.customer_cart || '[]');
     
-    // Simular estructura cliente/pedido para mantener compatibilidad con tus PDFs
-    const cliente = { 
-        nombre: session.customer_details.name, 
-        email: email,
-        direccion: session.customer_details.address 
-    };
+    // 1. RECONSTRUCCIÓN INTELIGENTE DEL CLIENTE
+    // Intentamos usar los datos ricos del formulario (Metadata)
+    // Si no existen, usamos lo que Stripe capturó (Fallback)
+    let cliente = {};
+    
+    if (session.metadata.customer_info) {
+        try {
+            cliente = JSON.parse(session.metadata.customer_info);
+            // Aseguramos que el email sea el que validó Stripe, por seguridad
+            cliente.email = email; 
+        } catch (e) {
+            console.warn("Error parseando customer_info de metadata", e);
+        }
+    }
+
+    // Si falló el metadata o está incompleto, rellenamos con datos de Stripe
+    if (!cliente.nombre) cliente.nombre = session.customer_details.name;
+    if (!cliente.direccion) cliente.direccion = session.customer_details.address;
+    if (!cliente.email) cliente.email = email;
+
     const pedido = { 
         items: itemsShort, 
         total: session.amount_total / 100 
     };
 
-    // 1. Guardar en DB
+    // 2. Guardar en DB
     if (dbPersistent) {
         try {
             // Verificar si ya existe para evitar duplicados por reintentos de webhook
@@ -386,19 +426,18 @@ async function handleStripeSuccess(session) {
                     session.payment_intent,
                     session.total_details?.amount_shipping ? session.total_details.amount_shipping / 100 : 0
                 );
-                console.log(`💰 Pago registrado: ${jobId}`);
+                console.log(`💰 Pago registrado y guardado: ${jobId}`);
             }
         } catch (e) { console.error("Error SQL Webhook:", e); }
     }
 
-    // 2. Generar PDF y Enviar Emails (Reutilizando tu worker)
-    // Usamos setImmediate para no bloquear la respuesta al webhook
+    // 3. Generar PDF y Enviar Emails
     setImmediate(() => {
         processOrderBackground(jobId, cliente, pedido).catch(e => console.error(e));
     });
 }
 
-// Reutilizamos tu Worker existente (ligeramente adaptado)
+// Reutilizamos tu Worker existente
 async function processOrderBackground(jobId, cliente, pedido) {
     // Generar PDF
     const pdfBuffer = await buildPDF(cliente, pedido, jobId, 'CLIENTE');
