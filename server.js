@@ -1,5 +1,5 @@
 // =========================================================
-// SERVER.JS - ETHERE4L BACKEND (PRODUCTION MASTER)
+// SERVER.JS - ETHERE4L BACKEND (PRODUCTION MASTER - NaN FIXED)
 // =========================================================
 
 // Cargar variables de entorno solo en local
@@ -14,7 +14,7 @@ const cors = require('cors');
 const Database = require('better-sqlite3');
 const { Resend } = require('resend');
 
-/* --- NUEVAS DEPENDENCIAS (SEGURIDAD & PAGOS) --- */
+/* --- DEPENDENCIAS (SEGURIDAD & PAGOS) --- */
 const Stripe = require('stripe');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
@@ -27,10 +27,27 @@ const { getEmailTemplate, getPaymentConfirmedEmail } = require('./utils/emailTem
 // ===============================
 // 0. CONFIGURACIÓN DE SEGURIDAD
 // ===============================
-const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+// .trim() es vital para evitar errores de conexión con Stripe
+const stripe = Stripe((process.env.STRIPE_SECRET_KEY || '').trim());
 const JWT_SECRET = process.env.JWT_SECRET || 'secret_dev_key_change_in_prod';
-const ADMIN_PASS_HASH = process.env.ADMIN_PASS_HASH; // Hash generado con bcrypt
-const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
+const ADMIN_PASS_HASH = process.env.ADMIN_PASS_HASH; 
+const STRIPE_WEBHOOK_SECRET = (process.env.STRIPE_WEBHOOK_SECRET || '').trim();
+
+// ===============================
+// 0.1 HELPER: SANITIZACIÓN NUMÉRICA (NUEVO - FIX NaN)
+// ===============================
+/**
+ * Convierte cualquier entrada (texto con $, null, undefined) a un número flotante seguro.
+ * Evita que Stripe crashee con "Invalid integer: NaN".
+ */
+function parseSafeNumber(value, fallback = 0) {
+    if (typeof value === 'number' && !isNaN(value)) return value;
+    if (!value) return fallback;
+    // Eliminar todo lo que no sea número o punto (ej: "$2,800.00" -> "2800.00")
+    const cleanString = String(value).replace(/[^0-9.]/g, '');
+    const number = parseFloat(cleanString);
+    return isNaN(number) ? fallback : number;
+}
 
 // ================= CATÁLOGO ESTÁTICO (VALIDACIÓN DE PRECIOS) =================
 let PRODUCTS_DB = [];
@@ -40,7 +57,7 @@ try {
     PRODUCTS_DB = require('./config/productos.json');
     console.log(`✅ productos.json cargado (${PRODUCTS_DB.length} productos)`);
 } catch (err) {
-    console.warn('⚠️ No se pudo cargar config/productos.json');
+    console.warn('⚠️ No se pudo cargar config/productos.json - Usando fallback frontend');
 }
 
 try {
@@ -155,7 +172,6 @@ if (RESEND_API_KEY) {
 // ===============================
 
 // ⚠️ IMPORTANTE: El webhook debe ir ANTES de express.json()
-// Usa express.raw para validar la firma de Stripe
 app.post('/api/webhook', express.raw({type: 'application/json'}), async (req, res) => {
     const sig = req.headers['stripe-signature'];
     let event;
@@ -186,38 +202,44 @@ app.get('/', (req, res) => {
     res.json({ status: 'online', service: 'ETHERE4L Backend v2.0', mode: 'Stripe Enabled' });
 });
 
-// --- NUEVO: CREAR SESIÓN DE PAGO (CORREGIDO ERR_INVALID_CHAR) ---
+// --- NUEVO: CREAR SESIÓN DE PAGO (CORREGIDO ERR_INVALID_CHAR + NaN FIX) ---
 app.post('/api/create-checkout-session', async (req, res) => {
     try {
         const { items, customer } = req.body;
         
-        // 1. DEFINICIÓN SEGURA DEL DOMINIO (Solución CRÍTICA al error 500)
-        // Definimos una URL base sólida. Si req.headers.origin falla, usamos el dominio hardcoded.
+        // 1. DEFINICIÓN SEGURA DEL DOMINIO
         const FRONTEND_URL = process.env.FRONTEND_URL || req.headers.origin || 'https://ethereal-frontend.netlify.app';
 
         let lineItems = [];
         let pesoTotal = 0;
 
-        // 2. Reconstruir orden segura (Validar precios vs JSON servidor)
+        // 2. Reconstruir orden segura
         for (const item of items) {
-            // Buscamos el producto en la DB local del servidor para asegurar precio real
+            // Buscamos el producto en la DB local del servidor
             const dbProduct = PRODUCTS_DB.length > 0 
                 ? PRODUCTS_DB.find(p => String(p.id) === String(item.id)) 
-                : { ...item, peso: item.peso || 0.6 }; 
+                : null; // Si no hay DB, es null
 
+            // Fallback al item del frontend si no hay DB
             const productFinal = dbProduct || item;
             
-            // Sanitización de peso
-            const pesoUnitario = parseFloat(productFinal.peso || 0.6);
-            pesoTotal += pesoUnitario * item.cantidad;
+            // --- FIX CRÍTICO NaN: SANITIZAR VALORES ---
+            // Aseguramos que el precio sea un número puro (sin '$' ni texto)
+            const rawPrice = dbProduct ? dbProduct.precio : item.precio;
+            const precioLimpio = parseSafeNumber(rawPrice, 0);
+            
+            // Aseguramos que el peso sea un número
+            const pesoLimpio = parseSafeNumber(productFinal.peso, 0.6);
+            pesoTotal += pesoLimpio * item.cantidad;
 
-            // Sanitización de imágenes (Stripe falla si la URL es relativa o vacía)
+            // --- Sanitización de imágenes ---
             let productImages = [];
-            if (productFinal.fotos && productFinal.fotos.length > 0) {
-                const img = productFinal.fotos[0];
-                if (img.startsWith('http')) { // Solo enviar si es URL absoluta válida
-                    productImages.push(img);
-                }
+            if (dbProduct && dbProduct.fotos && dbProduct.fotos.length > 0) {
+                 // Prioridad: Fotos del servidor
+                 productImages = [dbProduct.fotos[0]];
+            } else if (item.imagen && item.imagen.startsWith('http')) { 
+                // Fallback: Foto del frontend
+                productImages = [item.imagen];
             }
 
             lineItems.push({
@@ -231,9 +253,10 @@ app.post('/api/create-checkout-session', async (req, res) => {
                             id_producto: item.id
                         }
                     },
-                    unit_amount: Math.round(productFinal.precio * 100), // Stripe usa centavos
+                    // Usamos el precio limpio multiplicado por 100
+                    unit_amount: Math.round(precioLimpio * 100), 
                 },
-                quantity: item.cantidad,
+                quantity: parseSafeNumber(item.cantidad, 1),
             });
         }
 
@@ -250,16 +273,12 @@ app.post('/api/create-checkout-session', async (req, res) => {
         };
 
         if (customer) {
-            // Guardamos info esencial, sanitizando para evitar overflow o char invalidos
             metadata.customer_email = customer.email || '';
-            
             try {
-                // Serializamos solo lo necesario si el objeto es muy grande, o todo si cabe
                 const customerString = JSON.stringify(customer);
                 if (customerString.length < 450) {
                     metadata.customer_info = customerString;
                 } else {
-                    // Fallback simplificado si excede
                     metadata.customer_info = JSON.stringify({
                         nombre: customer.nombre,
                         email: customer.email
@@ -275,7 +294,6 @@ app.post('/api/create-checkout-session', async (req, res) => {
             payment_method_types: ['card'],
             line_items: lineItems,
             mode: 'payment',
-            // Pre-llenar email para mejorar UX
             customer_email: customer?.email, 
             shipping_options: [
                 {
@@ -290,7 +308,6 @@ app.post('/api/create-checkout-session', async (req, res) => {
                     },
                 },
             ],
-            // Usamos la URL Segura calculada al inicio
             success_url: `${FRONTEND_URL}/success.html`,
             cancel_url: `${FRONTEND_URL}/pedido.html`,
             metadata: metadata
@@ -300,14 +317,12 @@ app.post('/api/create-checkout-session', async (req, res) => {
 
     } catch (e) {
         console.error("❌ Error Stripe Checkout:", e);
-        // Devolvemos JSON incluso en error para que el frontend lo muestre
         res.status(500).json({ error: "Error creando sesión de pago: " + e.message });
     }
 });
 
-// (LEGACY) Endpoint manual anterior - Mantenido por compatibilidad
+// (LEGACY) Endpoint manual anterior
 app.post('/api/crear-pedido', (req, res) => {
-    // ... Tu lógica anterior intacta si la necesitas ...
     res.json({ success: true, message: "Use /api/create-checkout-session for payments" });
 });
 
@@ -318,13 +333,10 @@ app.post('/api/crear-pedido', (req, res) => {
 // Login Admin (JWT)
 app.post('/api/admin/login', adminLimiter, async (req, res) => {
     const { password } = req.body;
-    
-    // Comparar con hash guardado en .env
     if (ADMIN_PASS_HASH && await bcrypt.compare(password, ADMIN_PASS_HASH)) {
         const token = jwt.sign({ role: 'admin' }, JWT_SECRET, { expiresIn: '4h' });
         return res.json({ success: true, token });
     }
-    
     res.status(401).json({ error: 'Acceso Denegado' });
 });
 
@@ -333,7 +345,6 @@ app.get('/api/admin/orders', verifyToken, (req, res) => {
     if (!dbPersistent) return res.json([]);
     try {
         const orders = db.prepare("SELECT * FROM pedidos ORDER BY created_at DESC LIMIT 50").all();
-        // Parsear JSON stringificado de 'data'
         const parsedOrders = orders.map(o => ({
             ...o,
             data: JSON.parse(o.data)
@@ -347,7 +358,6 @@ app.get('/api/admin/orders', verifyToken, (req, res) => {
 // Actualizar Tracking (Protegido + Trigger Email)
 app.post('/api/admin/update-tracking', verifyToken, async (req, res) => {
     const { orderId, trackingNumber } = req.body;
-    
     try {
         const info = db.prepare(`
             UPDATE pedidos 
@@ -356,11 +366,7 @@ app.post('/api/admin/update-tracking', verifyToken, async (req, res) => {
         `).run(trackingNumber, orderId);
 
         if (info.changes > 0) {
-            // Recuperar datos para email
             const order = db.prepare("SELECT * FROM pedidos WHERE id=?").get(orderId);
-            const orderData = JSON.parse(order.data); // No se usa directamente pero valida integridad
-
-            // Enviar correo de tracking
             if (resend) {
                 await resend.emails.send({
                     from: `ETHERE4L Logistics <${SENDER_EMAIL}>`,
@@ -389,31 +395,26 @@ app.post('/api/admin/update-tracking', verifyToken, async (req, res) => {
 });
 
 // ===============================
-// 6. FUNCIONES INTERNAS
+// 6. FUNCIONES INTERNAS (WEBHOOK LOGIC)
 // ===============================
 
 // Manejo post-pago de Stripe
 async function handleStripeSuccess(session) {
     const jobId = session.id; 
     const email = session.customer_details.email; // Email confirmado por Stripe
-    const itemsShort = JSON.parse(session.metadata.customer_cart_summary || '[]'); // Fallback a empty array si falla
+    const itemsShort = JSON.parse(session.metadata.customer_cart_summary || '[]'); 
     
     // 1. RECONSTRUCCIÓN INTELIGENTE DEL CLIENTE
-    // Intentamos usar los datos ricos del formulario (Metadata)
-    // Si no existen, usamos lo que Stripe capturó (Fallback)
     let cliente = {};
-    
     if (session.metadata.customer_info) {
         try {
             cliente = JSON.parse(session.metadata.customer_info);
-            // Aseguramos que el email sea el que validó Stripe, por seguridad
             cliente.email = email; 
         } catch (e) {
             console.warn("Error parseando customer_info de metadata", e);
         }
     }
 
-    // Si falló el metadata o está incompleto, rellenamos con datos de Stripe
     if (!cliente.nombre) cliente.nombre = session.customer_details.name;
     if (!cliente.direccion) cliente.direccion = session.customer_details.address;
     if (!cliente.email) cliente.email = email;
@@ -426,7 +427,6 @@ async function handleStripeSuccess(session) {
     // 2. Guardar en DB
     if (dbPersistent) {
         try {
-            // Verificar si ya existe para evitar duplicados por reintentos de webhook
             const exists = db.prepare("SELECT id FROM pedidos WHERE id=?").get(jobId);
             if (!exists) {
                 db.prepare(`
@@ -436,7 +436,7 @@ async function handleStripeSuccess(session) {
                     jobId, 
                     email, 
                     JSON.stringify({ cliente, pedido }), 
-                    session.payment_intent,
+                    session.payment_intent, 
                     session.total_details?.amount_shipping ? session.total_details.amount_shipping / 100 : 0
                 );
                 console.log(`💰 Pago registrado y guardado: ${jobId}`);
@@ -452,20 +452,17 @@ async function handleStripeSuccess(session) {
 
 // Reutilizamos tu Worker existente
 async function processOrderBackground(jobId, cliente, pedido) {
-    // Generar PDF
     const pdfBuffer = await buildPDF(cliente, pedido, jobId, 'CLIENTE');
 
     if (resend) {
-        // Email Cliente
         await resend.emails.send({
             from: `ETHERE4L <${SENDER_EMAIL}>`,
             to: [cliente.email],
             subject: `Confirmación de Pedido ${jobId.slice(-6)}`,
-            html: getPaymentConfirmedEmail(cliente, pedido, jobId), // Usar plantilla de pago
+            html: getPaymentConfirmedEmail(cliente, pedido, jobId),
             attachments: [{ filename: `Orden_${jobId.slice(-6)}.pdf`, content: pdfBuffer }]
         });
 
-        // Email Admin
         if (ADMIN_EMAIL) {
             await resend.emails.send({
                 from: `System <${SENDER_EMAIL}>`,
