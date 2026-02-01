@@ -32,14 +32,24 @@ const JWT_SECRET = process.env.JWT_SECRET || 'secret_dev_key_change_in_prod';
 const ADMIN_PASS_HASH = process.env.ADMIN_PASS_HASH; // Hash generado con bcrypt
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
 
-// Cargar catálogo para validación de precios (Evita manipulación frontend)
+// ================= CATÁLOGO ESTÁTICO (VALIDACIÓN DE PRECIOS) =================
 let PRODUCTS_DB = [];
+let CATALOG_DB = [];
+
 try {
-    // Asume que el archivo está en la raíz o carpeta data
-    PRODUCTS_DB = require('./data/productos.json'); 
-} catch (e) {
-    console.warn("⚠️ Advertencia: No se pudo cargar productos.json para validación de precios.");
+    PRODUCTS_DB = require('./config/productos.json');
+    console.log(`✅ productos.json cargado (${PRODUCTS_DB.length} productos)`);
+} catch (err) {
+    console.warn('⚠️ No se pudo cargar config/productos.json');
 }
+
+try {
+    CATALOG_DB = require('./config/catalogo.json');
+    console.log(`✅ catalogo.json cargado (${CATALOG_DB.length} items)`);
+} catch (err) {
+    console.warn('⚠️ No se pudo cargar config/catalogo.json');
+}
+
 
 // ===============================
 // 1. DATABASE SETUP (PERSISTENCIA)
