@@ -261,11 +261,35 @@ app.post('/api/create-checkout-session', async (req, res) => {
         }
 
         // 3. Calcular Envío Logístico
+        // ... (dentro de /api/create-checkout-session, después del loop for)
+
+        // 3. LOGICA DE ENVÍO COMERCIAL (Items + Peso)
+        // Regla: 1 item ($45 USD), 2 items ($50 USD), 3 items ($65 USD), 4+ (Tarifa plana/gratis)
+        // Asumiendo TC aprox 20 MXN por USD
+        
+        const totalItems = items.reduce((acc, item) => acc + item.cantidad, 0);
         let costoEnvio = 0;
-        if (pesoTotal <= 1.0) costoEnvio = 350;      // MXN
-        else if (pesoTotal <= 3.0) costoEnvio = 650; // MXN
-        else if (pesoTotal <= 5.0) costoEnvio = 950; // MXN
-        else costoEnvio = 1500;                      // MXN Heavy Haul
+
+        if (totalItems === 1) {
+            costoEnvio = 900; // ~$45 USD (Envío unitario caro)
+        } else if (totalItems === 2) {
+            costoEnvio = 1000; // ~$50 USD (Baja considerablemente por pieza)
+        } else if (totalItems === 3) {
+            costoEnvio = 1300; // ~$65 USD
+        } else {
+            // 4+ Piezas (Lote grande): 
+            // Opción A: Cobrar un cap (ej. 1500 MXN)
+            // Opción B: Envío Gratis (descomentar si aplica)
+            // costoEnvio = 0; 
+            costoEnvio = 1500; // ~$75 USD Cap de Heavy Haul
+        }
+
+        // Safety Check: Si el peso es extraordinario (>10kg) cobrar extra
+        if (pesoTotal > 10.0) {
+            costoEnvio += 500; // Sobrecargo por exceso de dimensiones
+        }
+
+        // ... (continuar con session = await stripe...)
 
         // 4. Preparar Metadata (Sanitizada para evitar overflow)
         const metadata = {
