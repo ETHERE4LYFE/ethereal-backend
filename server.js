@@ -45,9 +45,9 @@ try {
 
 try {
     CATALOG_DB = require('./config/catalogo.json');
-    console.log(`✅ catalogos.json cargado (${CATALOG_DB.length} items)`);
+    console.log(`✅ catalogo.json cargado (${CATALOG_DB.length} items)`);
 } catch (err) {
-    console.warn('⚠️ No se pudo cargar config/catalogos.json');
+    console.warn('⚠️ No se pudo cargar config/catalogo.json');
 }
 
 
