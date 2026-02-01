@@ -1,0 +1,62 @@
+[
+    {
+        "id": "balenciaga",
+        "nombre": "Balenciaga Collection",
+        "imagen": "images/catalogos/balenciaga/001/principal.png",
+        "descripcion": "High-end streetwear aesthetics."
+    },
+    {
+        "id": "chrome-hearts",
+        "nombre": "Chrome Hearts",
+        "imagen": "images/catalogos/chromehearts/portada.webp",
+        "descripcion": "Luxury silver and leather details."
+    },
+    {
+        "id": "hellstar",
+        "nombre": "Hellstar Studios",
+        "imagen": "images/catalogos/hellstar/portada.webp",
+        "descripcion": "Graphic-heavy punk inspired pieces."
+    },
+        {
+        "id": "supreme",
+        "nombre": "Supreme",
+        "imagen": "images/catalogos/supreme/portada.webp",
+        "descripcion": "Graphic-heavy punk inspired pieces."
+    },
+            {
+        "id": "acne-studios",
+        "nombre": "Acne Studios",
+        "imagen": "images/catalogos/acnestudios/portada.webp",
+        "descripcion": "Minimalist Scandinavian design."
+    },
+                {
+        "id": "maison-margiela",
+        "nombre": "Maison Margiela",
+        "imagen": "images/catalogos/maisonmargiela/portada.webp",
+        "descripcion": "Deconstructed and avant-garde fashion."
+    },
+                    {
+        "id": "designer-shoes",
+        "nombre": "Designer Shoes",
+        "imagen": "images/catalogos/designer-shoes/portada.webp",
+        "descripcion": "Luxury footwear from top designers."
+    },
+                        {
+        "id": "cozy-worldwide",
+        "nombre": "Cozy Worldwide",
+        "imagen": "images/catalogos/cozy-worldwide/portada.webp",
+        "descripcion": "Luxury footwear from top designers."
+    },
+                            {
+        "id": "jaded-london",
+        "nombre": "Jaded London",
+        "imagen": "images/catalogos/jaded-london/portada.webp",
+        "descripcion": "Luxury designers."
+    },
+                                {
+        "id": "accessories",
+        "nombre": "Accesories",
+        "imagen": "images/catalogos/accessories/portada.webp",
+        "descripcion": "Luxury accessories."
+    }
+]
