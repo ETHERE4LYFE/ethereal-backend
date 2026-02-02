@@ -87,7 +87,8 @@ function getEmailTemplate(cliente, pedido, jobId, isAdmin) {
 `;
 }
 
-function getPaymentConfirmedEmail(cliente, pedido, jobId) {
+function getPaymentConfirmedEmail(cliente, pedido, jobId, trackingUrl) {
+
     const totalFormatted = new Intl.NumberFormat('es-MX', {
         style: 'currency',
         currency: 'MXN'
@@ -121,6 +122,15 @@ function getPaymentConfirmedEmail(cliente, pedido, jobId) {
                 <p><b>Total pagado:</b> ${totalFormatted}</p>
                 <p><b>Estado:</b> PAGADO</p>
             </div>
+            <div style="text-align:center;margin-top:30px;">
+    <a href="${trackingUrl}" style="${styles.button}">
+        VER ESTADO DEL PEDIDO
+    </a>
+    <p style="font-size:11px;color:#777;margin-top:10px;">
+        Enlace seguro válido por 7 días
+    </p>
+</div>
+
 
             <p>En breve recibirás actualizaciones sobre el envío.</p>
 

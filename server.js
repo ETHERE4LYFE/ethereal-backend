@@ -49,6 +49,18 @@ function parseSafeNumber(value, fallback = 0) {
     return isNaN(number) ? fallback : number;
 }
 
+// ===============================
+// 0.2 HELPER: TOKEN PASSWORDLESS POR PEDIDO
+// ===============================
+function generateOrderToken(orderId, email) {
+    return jwt.sign(
+        { o: orderId, e: email },
+        JWT_SECRET,
+        { expiresIn: '7d' }
+    );
+}
+
+
 // ================= CATÁLOGO ESTÁTICO (VALIDACIÓN DE PRECIOS) =================
 let PRODUCTS_DB = [];
 let CATALOG_DB = [];
@@ -263,8 +275,24 @@ app.post('/api/create-checkout-session', async (req, res) => {
                     unit_amount: Math.round(precioLimpio * 100), 
                 },
                 quantity: parseSafeNumber(item.cantidad, 1),
+                
+
             });
-        }
+ // ===============================
+ // 0.2 HELPER: TOKEN PASSWORDLESS POR PEDIDO
+ // ===============================
+function generateOrderToken(orderId, email) {
+    return jwt.sign(
+        { o: orderId, e: email },
+        JWT_SECRET,
+        { expiresIn: '7d' }
+    );
+}
+
+}
+
+
+
 
         // 3. Calcular Envío Logístico
         // ... (dentro de /api/create-checkout-session, después del loop for)
@@ -355,6 +383,65 @@ app.post('/api/create-checkout-session', async (req, res) => {
 app.post('/api/crear-pedido', (req, res) => {
     res.json({ success: true, message: "Use /api/create-checkout-session for payments" });
 });
+
+
+
+
+
+// ===============================
+// 4.1 API TRACKING PASSWORDLESS
+// ===============================
+const trackingLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 50,
+    message: "Demasiados intentos de acceso."
+});
+
+app.get('/api/orders/track/:orderId', trackingLimiter, (req, res) => {
+    const { orderId } = req.params;
+    const { token } = req.query;
+
+    if (!token) return res.status(401).json({ error: "Token requerido" });
+
+    try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+
+        if (decoded.o !== orderId) {
+            return res.status(403).json({ error: "Token inválido" });
+        }
+
+        if (!dbPersistent) {
+            return res.status(503).json({ error: "DB no disponible" });
+        }
+
+        const orderRow = db.prepare("SELECT * FROM pedidos WHERE id=?").get(orderId);
+        if (!orderRow) return res.status(404).json({ error: "Orden no encontrada" });
+
+        if (orderRow.email !== decoded.e) {
+            return res.status(403).json({ error: "Acceso denegado" });
+        }
+
+        const orderData = JSON.parse(orderRow.data);
+
+        res.json({
+            id: orderRow.id,
+            created_at: orderRow.created_at,
+            status: orderRow.status,
+            tracking_number: orderRow.tracking_number,
+            shipping_cost: orderRow.shipping_cost,
+            items: orderData.pedido.items,
+            total: orderData.pedido.total,
+            cliente: {
+                nombre: orderData.cliente.nombre,
+                direccion: orderData.cliente.direccion
+            }
+        });
+
+    } catch (err) {
+        return res.status(401).json({ error: "Enlace expirado o inválido" });
+    }
+});
+
 
 // ===============================
 // 5. API ENDPOINTS (ADMIN)
@@ -515,13 +602,19 @@ async function handleStripeSuccess(session) {
 async function processOrderBackground(jobId, cliente, pedido) {
     const pdfBuffer = await buildPDF(cliente, pedido, jobId, 'CLIENTE');
 
+    const accessToken = generateOrderToken(jobId, cliente.email);
+    const FRONTEND_URL = process.env.FRONTEND_URL || 'https://ethereal-frontend.netlify.app';
+    const trackingUrl = `${FRONTEND_URL}/pedido.html?order=${jobId}&token=${accessToken}`;
+
     if (resend) {
         await resend.emails.send({
             from: `ETHERE4L <${SENDER_EMAIL}>`,
             to: [cliente.email],
             subject: `Confirmación de Pedido ${jobId.slice(-6)}`,
-            html: getPaymentConfirmedEmail(cliente, pedido, jobId),
-            attachments: [{ filename: `Orden_${jobId.slice(-6)}.pdf`, content: pdfBuffer }]
+            html: getPaymentConfirmedEmail(cliente, pedido, jobId, trackingUrl),
+            attachments: [
+                { filename: `Orden_${jobId.slice(-6)}.pdf`, content: pdfBuffer }
+            ]
         });
 
         if (ADMIN_EMAIL) {
@@ -530,11 +623,14 @@ async function processOrderBackground(jobId, cliente, pedido) {
                 to: [ADMIN_EMAIL],
                 subject: `💰 NUEVA VENTA - ${jobId.slice(-6)}`,
                 html: getEmailTemplate(cliente, pedido, jobId, true),
-                attachments: [{ filename: `Orden_${jobId.slice(-6)}.pdf`, content: pdfBuffer }]
+                attachments: [
+                    { filename: `Orden_${jobId.slice(-6)}.pdf`, content: pdfBuffer }
+                ]
             });
         }
     }
 }
+
 
 // ===============================
 // START SERVER
