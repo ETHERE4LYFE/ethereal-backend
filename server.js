@@ -562,6 +562,8 @@ app.post('/api/magic-link', magicLinkLimiter, async (req, res) => {
                     html: getMagicLinkEmail(link)
                 }
             );
+            logger.info('MAGIC_LINK_SENT', { email: cleanEmail });
+
 }
 
 
