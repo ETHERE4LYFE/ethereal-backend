@@ -132,11 +132,29 @@ try {
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     `);
+    
+    // ===============================
+    // MIGRACIÓN SEGURA DE COLUMNAS (Railway-safe)
+    // ===============================
     try {
-    db.exec(`ALTER TABLE pedidos ADD COLUMN shipping_cost REAL`);
-} catch (e) {
-    // Ignorar si ya existe
-}
+        const columns = db
+            .prepare(`PRAGMA table_info(pedidos)`)
+            .all()
+            .map(col => col.name);
+
+        if (!columns.includes('tracking_number')) {
+            db.exec(`ALTER TABLE pedidos ADD COLUMN tracking_number TEXT`);
+            console.log('🧱 Columna tracking_number añadida');
+        }
+
+        if (!columns.includes('shipping_cost')) {
+            db.exec(`ALTER TABLE pedidos ADD COLUMN shipping_cost REAL`);
+            console.log('🧱 Columna shipping_cost añadida');
+        }
+    } catch (e) {
+        console.error('⚠️ Error en migración segura:', e.message);
+    }
+
 
 
     dbPersistent = true;
