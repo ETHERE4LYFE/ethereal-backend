@@ -20,9 +20,15 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const rateLimit = require('express-rate-limit');
 
+
 // ✅ IMPORTACIONES CLAVE
 const { buildPDF } = require('./utils/pdfGenerator');
-const { getEmailTemplate, getPaymentConfirmedEmail } = require('./utils/emailTemplates');
+const {
+    getEmailTemplate,
+    getPaymentConfirmedEmail,
+    getMagicLinkEmail
+} = require('./utils/emailTemplates');
+
 
 // ===============================
 // 0. CONFIGURACIÓN DE SEGURIDAD
@@ -32,6 +38,17 @@ const stripe = Stripe((process.env.STRIPE_SECRET_KEY || '').trim());
 const JWT_SECRET = process.env.JWT_SECRET || 'secret_dev_key_change_in_prod';
 const ADMIN_PASS_HASH = process.env.ADMIN_PASS_HASH; 
 const STRIPE_WEBHOOK_SECRET = (process.env.STRIPE_WEBHOOK_SECRET || '').trim();
+
+// RATE LIMITER: MAGIC LINK
+const magicLinkLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000, // 1 hora
+    max: 5,
+    message: "Demasiadas solicitudes. Intenta más tarde."
+});
+
+
+
+
 
 // ===============================
 // 0.1 HELPER: SANITIZACIÓN NUMÉRICA (NUEVO - FIX NaN)
@@ -135,6 +152,19 @@ const app = express();
    =============================== */
 app.set('trust proxy', 1);
 
+// ===============================
+// OBSERVABILIDAD: LOGGER ESTRUCTURADO
+// ===============================
+const logger = {
+    info: (msg, ctx = {}) =>
+        console.log(`[INFO] ${new Date().toISOString()} | ${msg} | ${JSON.stringify(ctx)}`),
+    warn: (msg, ctx = {}) =>
+        console.warn(`[WARN] ${new Date().toISOString()} | ${msg} | ${JSON.stringify(ctx)}`),
+    error: (msg, ctx = {}) =>
+        console.error(`[ERROR] ${new Date().toISOString()} | ${msg} | ${JSON.stringify(ctx)}`)
+};
+
+
 
 const PORT = process.env.PORT || 3000;
 
@@ -160,6 +190,28 @@ function verifyToken(req, res, next) {
         res.sendStatus(401);
     }
 }
+
+
+// ===============================
+// OBSERVABILIDAD: REQUEST CORRELATION
+// ===============================
+app.use((req, res, next) => {
+    req.requestId = `req_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+    const start = Date.now();
+
+    res.on('finish', () => {
+        logger.info('HTTP_REQUEST', {
+            requestId: req.requestId,
+            method: req.method,
+            path: req.originalUrl,
+            status: res.statusCode,
+            ip: req.ip,
+            durationMs: Date.now() - start
+        });
+    });
+
+    next();
+});
 
 // Configuración CORS
 app.use(cors({
@@ -275,21 +327,8 @@ app.post('/api/create-checkout-session', async (req, res) => {
                     unit_amount: Math.round(precioLimpio * 100), 
                 },
                 quantity: parseSafeNumber(item.cantidad, 1),
-                
-
             });
- // ===============================
- // 0.2 HELPER: TOKEN PASSWORDLESS POR PEDIDO
- // ===============================
-function generateOrderToken(orderId, email) {
-    return jwt.sign(
-        { o: orderId, e: email },
-        JWT_SECRET,
-        { expiresIn: '7d' }
-    );
-}
-
-}
+            }
 
 
 
@@ -415,6 +454,10 @@ app.get('/api/orders/track/:orderId', trackingLimiter, (req, res) => {
         }
 
         const orderRow = db.prepare("SELECT * FROM pedidos WHERE id=?").get(orderId);
+        if (!dbPersistent) {
+            return res.json({ success: true });
+        }
+
         if (!orderRow) return res.status(404).json({ error: "Orden no encontrada" });
 
         if (orderRow.email !== decoded.e) {
@@ -488,6 +531,100 @@ app.post('/api/admin/login', adminLimiter, async (req, res) => {
 });
 
 
+
+app.post('/api/magic-link', magicLinkLimiter, async (req, res) => {
+    try {
+        const { email } = req.body;
+        const cleanEmail = String(email || '').trim().toLowerCase();
+
+        if (!cleanEmail || !cleanEmail.includes('@')) {
+            return res.json({ success: true });
+        }
+
+        const hasOrders = db
+            .prepare("SELECT 1 FROM pedidos WHERE email = ? LIMIT 1")
+            .get(cleanEmail);
+
+            if (hasOrders && resend) {
+                const magicToken = jwt.sign(
+                    { email: cleanEmail, scope: 'read_orders' },
+                    process.env.JWT_SECRET,
+                    { expiresIn: '1h' }
+                );
+                
+                const FRONTEND_URL =
+                process.env.FRONTEND_URL || 'https://ethereal-frontend.netlify.app';
+                const link = `${FRONTEND_URL}/mis-pedidos.html?token=${magicToken}`;
+                await resend.emails.send({
+                    from: `ETHERE4L <${SENDER_EMAIL}>`,
+                    to: [cleanEmail],
+                    subject: "Accede a tus pedidos – ETHERE4L",
+                    html: getMagicLinkEmail(link)
+                }
+            );
+}
+
+
+        // 🔐 RESPUESTA SIEMPRE POSITIVA
+        res.json({ success: true });
+
+    } catch (err) {
+        console.error('Magic link error:', err);
+        res.json({ success: true });
+    }
+});
+
+
+app.get('/api/my-orders', (req, res) => {
+    const auth = req.headers.authorization;
+    if (!auth) return res.sendStatus(401);
+
+    const token = auth.split(' ')[1];
+
+    try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+        if (decoded.scope !== 'read_orders') {
+            return res.sendStatus(403);
+        }
+
+        const orders = db.prepare(`
+            SELECT id, status, created_at, data, tracking_number
+            FROM pedidos
+            WHERE email = ?
+            ORDER BY created_at DESC
+        `).all(decoded.email);
+
+        const response = orders.map(row => {
+            const parsed = JSON.parse(row.data);
+
+            const orderToken = generateOrderToken(
+                row.id,
+                decoded.email
+            );
+
+            return {
+                id: row.id,
+                status: row.status,
+                date: row.created_at,
+                total: parsed.pedido.total,
+                item_count: parsed.pedido.items.length,
+                items_summary: parsed.pedido.items.map(i => i.nombre).join(', '),
+                tracking_number: row.tracking_number,
+                access_token: orderToken
+            };
+        });
+
+        res.json({ orders: response });
+
+    } catch (err) {
+        console.error('My orders error:', err);
+        res.sendStatus(403);
+    }
+});
+
+
+
 // Obtener Órdenes (Protegido)
 app.get('/api/admin/orders', verifyToken, (req, res) => {
     if (!dbPersistent) return res.json([]);
@@ -548,6 +685,12 @@ app.post('/api/admin/update-tracking', verifyToken, async (req, res) => {
 
 // Manejo post-pago de Stripe
 async function handleStripeSuccess(session) {
+    const start = Date.now();
+logger.info('WEBHOOK_START', {
+    orderId: session.id,
+    amount: session.amount_total
+});
+
     const jobId = session.id; 
     const email = session.customer_details.email; // Email confirmado por Stripe
     const itemsShort = JSON.parse(session.metadata.customer_cart_summary || '[]'); 
@@ -589,7 +732,13 @@ async function handleStripeSuccess(session) {
                 );
                 console.log(`💰 Pago registrado y guardado: ${jobId}`);
             }
-        } catch (e) { console.error("Error SQL Webhook:", e); }
+            } catch (e) {
+                logger.error('DB_WRITE_ERROR', {
+                    orderId: jobId,
+                    error: e.message
+    });
+}
+
     }
 
     // 3. Generar PDF y Enviar Emails
@@ -642,3 +791,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
 process.on('SIGTERM', () => {
     server.close(() => console.log('Servidor cerrado.'));
 });
+
+logger.info('MAGIC_LINK_SENT', { email: cleanEmail });
+
+

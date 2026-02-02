@@ -146,7 +146,32 @@ function getPaymentConfirmedEmail(cliente, pedido, jobId, trackingUrl) {
 `;
 }
 
+
+const getMagicLinkEmail = (link) => `
+<div style="font-family:sans-serif;max-width:500px;margin:auto;padding:40px;text-align:center">
+  <h2>Acceso a tus pedidos</h2>
+  <p>Solicitaste ver tu historial de compras en <strong>ETHERE4L</strong>.</p>
+
+  <a href="${link}" style="
+    display:inline-block;
+    margin:30px 0;
+    padding:15px 30px;
+    background:#000;
+    color:#fff;
+    text-decoration:none;
+    font-weight:bold">
+    VER MIS PEDIDOS
+  </a>
+
+  <p style="font-size:12px;color:#777">
+    Este enlace expira en 1 hora por tu seguridad.
+  </p>
+</div>
+`;
+
+
 module.exports = {
     getEmailTemplate,
-    getPaymentConfirmedEmail
+    getPaymentConfirmedEmail,
+    getMagicLinkEmail
 };
