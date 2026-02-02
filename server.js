@@ -132,6 +132,12 @@ try {
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     `);
+    try {
+    db.exec(`ALTER TABLE pedidos ADD COLUMN shipping_cost REAL`);
+} catch (e) {
+    // Ignorar si ya existe
+}
+
 
     dbPersistent = true;
     console.log('✅ DB Conectada y Persistente');
@@ -546,7 +552,7 @@ app.post('/api/magic-link', magicLinkLimiter, async (req, res) => {
             const magicToken = jwt.sign(
                 { email: cleanEmail, scope: 'read_orders' },
                 process.env.JWT_SECRET,
-                { expiresIn: '1h' }
+                { expiresIn: '24h' }
             );
 
             const FRONTEND_URL =
