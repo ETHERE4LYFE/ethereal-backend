@@ -454,9 +454,6 @@ app.get('/api/orders/track/:orderId', trackingLimiter, (req, res) => {
         }
 
         const orderRow = db.prepare("SELECT * FROM pedidos WHERE id=?").get(orderId);
-        if (!dbPersistent) {
-            return res.json({ success: true });
-        }
 
         if (!orderRow) return res.status(404).json({ error: "Orden no encontrada" });
 
@@ -545,33 +542,33 @@ app.post('/api/magic-link', magicLinkLimiter, async (req, res) => {
             .prepare("SELECT 1 FROM pedidos WHERE email = ? LIMIT 1")
             .get(cleanEmail);
 
-            if (hasOrders && resend) {
-                const magicToken = jwt.sign(
-                    { email: cleanEmail, scope: 'read_orders' },
-                    process.env.JWT_SECRET,
-                    { expiresIn: '1h' }
-                );
-                
-                const FRONTEND_URL =
-                process.env.FRONTEND_URL || 'https://ethereal-frontend.netlify.app';
-                const link = `${FRONTEND_URL}/mis-pedidos.html?token=${magicToken}`;
-                await resend.emails.send({
-                    from: `ETHERE4L <${SENDER_EMAIL}>`,
-                    to: [cleanEmail],
-                    subject: "Accede a tus pedidos – ETHERE4L",
-                    html: getMagicLinkEmail(link)
-                }
+        if (hasOrders && resend) {
+            const magicToken = jwt.sign(
+                { email: cleanEmail, scope: 'read_orders' },
+                process.env.JWT_SECRET,
+                { expiresIn: '1h' }
             );
+
+            const FRONTEND_URL =
+                process.env.FRONTEND_URL || 'https://ethereal-frontend.netlify.app';
+
+            const link = `${FRONTEND_URL}/mis-pedidos.html?token=${magicToken}`;
+
+            await resend.emails.send({
+                from: `ETHERE4L <${SENDER_EMAIL}>`,
+                to: [cleanEmail],
+                subject: "Accede a tus pedidos – ETHERE4L",
+                html: getMagicLinkEmail(link)
+            });
+
             logger.info('MAGIC_LINK_SENT', { email: cleanEmail });
+        }
 
-}
-
-
-        // 🔐 RESPUESTA SIEMPRE POSITIVA
+        // 🔐 Respuesta SIEMPRE positiva (anti-enumeración)
         res.json({ success: true });
 
     } catch (err) {
-        console.error('Magic link error:', err);
+        logger.error('MAGIC_LINK_ERROR', { error: err.message });
         res.json({ success: true });
     }
 });
@@ -794,6 +791,6 @@ process.on('SIGTERM', () => {
     server.close(() => console.log('Servidor cerrado.'));
 });
 
-logger.info('MAGIC_LINK_SENT', { email: cleanEmail });
+
 
 
