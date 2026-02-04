@@ -317,10 +317,15 @@ app.get('/', (req, res) => {
     res.json({ status: 'online', service: 'ETHERE4L Backend v2.0', mode: 'Stripe Enabled' });
 });
 
+
+
 // --- NUEVO: CREAR SESIÓN DE PAGO (CORREGIDO ERR_INVALID_CHAR + NaN FIX) ---
 app.post('/api/create-checkout-session', async (req, res) => {
     try {
         const { items, customer } = req.body;
+
+        const tempOrderId = `ord_${Date.now()}_${Math.random().toString(36).slice(2,6)}`;
+
         
         // 1. DEFINICIÓN SEGURA DEL DOMINIO
         const FRONTEND_URL = process.env.FRONTEND_URL || req.headers.origin || 'https://ethereal-frontend.netlify.app';
@@ -409,10 +414,6 @@ app.post('/api/create-checkout-session', async (req, res) => {
 
         // ... (continuar con session = await stripe...)
 
-        // 4. Preparar Metadata (Sanitizada para evitar overflow)
-        const metadata = {
-            customer_cart_summary: JSON.stringify(items.map(i => `${i.id}(${i.cantidad})`)).substring(0, 500)
-        };
 
         if (customer) {
             metadata.customer_email = customer.email || '';
@@ -431,15 +432,64 @@ app.post('/api/create-checkout-session', async (req, res) => {
             }
         }
 
+        // ===============================
+// SNAPSHOT REAL DEL PEDIDO (DB SOURCE OF TRUTH)
+// ===============================
+
+const pedidoSnapshot = {
+    items: items.map(item => {
+        const dbProduct = PRODUCTS_DB.find(p => String(p.id) === String(item.id)) || item;
+        const precio = parseSafeNumber(dbProduct.precio || item.precio, 0);
+
+        return {
+            id: item.id,
+            nombre: dbProduct.nombre || item.nombre,
+            imagen: (dbProduct.fotos && dbProduct.fotos[0]) || item.imagen || null,
+            talla: item.talla || null,
+            cantidad: item.cantidad,
+            precio,
+            subtotal: precio * item.cantidad
+        };
+    }),
+    subtotal: items.reduce(
+        (sum, i) => sum + (parseSafeNumber(i.precio) * i.cantidad), 0
+    ),
+    envio: costoEnvio,
+    total: items.reduce(
+        (sum, i) => sum + (parseSafeNumber(i.precio) * i.cantidad), 0
+    ) + costoEnvio
+};
+
+
+
+db.prepare(`
+    INSERT INTO pedidos (id, email, data, status, shipping_cost)
+    VALUES (?, ?, ?, 'PENDIENTE', ?)
+`).run(
+    tempOrderId,
+    customer?.email || '',
+    JSON.stringify({
+        cliente: customer,
+        pedido: pedidoSnapshot
+    }),
+    costoEnvio
+);
+
+
+
+
+
         // 5. Crear Sesión Stripe
         const session = await stripe.checkout.sessions.create({
-            payment_method_types: ['card'],
-            line_items: lineItems,
-            mode: 'payment',
-            customer_email: customer?.email, 
-            shipping_options: [
-                {
-                    shipping_rate_data: {
+                payment_method_types: ['card'],
+                line_items: lineItems,
+                mode: 'payment',
+                customer_email: customer?.email,
+                metadata: {
+                order_id: tempOrderId},
+                shipping_options: [
+                    {
+                        shipping_rate_data: {
                         type: 'fixed_amount',
                         fixed_amount: { amount: costoEnvio * 100, currency: 'mxn' },
                         display_name: 'Envío Logístico Privado (Tracked)',
@@ -452,7 +502,6 @@ app.post('/api/create-checkout-session', async (req, res) => {
             ],
             success_url: `${FRONTEND_URL}/success.html`,
             cancel_url: `${FRONTEND_URL}/pedido.html`,
-            metadata: metadata
         });
 
         res.json({ url: session.url });
@@ -777,15 +826,39 @@ function getStatusDescription(status) {
 
 // Manejo post-pago de Stripe
 async function handleStripeSuccess(session) {
-    const start = Date.now();
-logger.info('WEBHOOK_START', {
-    orderId: session.id,
-    amount: session.amount_total
-});
+    const orderId = session.metadata?.order_id;
+    if (!orderId) {
+        console.error('❌ Webhook sin order_id');
+        return;
+    }
 
-    const jobId = session.id; 
-    const email = session.customer_details.email; // Email confirmado por Stripe
-    const itemsShort = JSON.parse(session.metadata.customer_cart_summary || '[]'); 
+    if (!dbPersistent) return;
+
+    db.prepare(`
+        UPDATE pedidos
+        SET 
+            status = 'PAGADO',
+            payment_ref = ?,
+            paid_at = datetime('now')
+        WHERE id = ?
+    `).run(
+        session.payment_intent,
+        orderId
+    );
+
+    const row = db.prepare(`SELECT data FROM pedidos WHERE id=?`).get(orderId);
+    if (!row) return;
+
+    const parsed = JSON.parse(row.data);
+    const cliente = parsed.cliente;
+    const pedido = parsed.pedido;
+
+    setImmediate(() => {
+        processOrderBackground(orderId, cliente, pedido)
+            .catch(e => console.error(e));
+    });
+}
+
     
     // 1. RECONSTRUCCIÓN INTELIGENTE DEL CLIENTE
     let cliente = {};
@@ -802,26 +875,27 @@ logger.info('WEBHOOK_START', {
     if (!cliente.direccion) cliente.direccion = session.customer_details.address;
     if (!cliente.email) cliente.email = email;
 
-    const pedido = { 
-        items: itemsShort, 
-        total: session.amount_total / 100 
-    };
-
     // 2. Guardar en DB
     if (dbPersistent) {
         try {
-            const exists = db.prepare("SELECT id FROM pedidos WHERE id=?").get(jobId);
             if (!exists) {
                 db.prepare(`
-                    INSERT INTO pedidos (id, email, data, status, payment_ref, paid_at, shipping_cost) 
-                    VALUES (?, ?, ?, 'PAGADO', ?, datetime('now'), ?)
-                `).run(
-                    jobId, 
-                    email, 
-                    JSON.stringify({ cliente, pedido }), 
-                    session.payment_intent, 
-                    session.total_details?.amount_shipping ? session.total_details.amount_shipping / 100 : 0
-                );
+                    UPDATE pedidos
+                    SET 
+                    status = 'PAGADO',
+                    payment_ref = ?,
+                    paid_at = datetime('now')
+                    WHERE id = ?
+                    `).run(
+                        session.payment_intent,
+                        orderId
+                    );
+                    const row = db.prepare(`SELECT data FROM pedidos WHERE id=?`).get(orderId);
+                    const parsed = JSON.parse(row.data);
+                    const cliente = parsed.cliente;
+                    const pedido = parsed.pedido;
+
+
                 console.log(`💰 Pago registrado y guardado: ${jobId}`);
             }
             } catch (e) {
@@ -835,9 +909,8 @@ logger.info('WEBHOOK_START', {
 
     // 3. Generar PDF y Enviar Emails
     setImmediate(() => {
-        processOrderBackground(jobId, cliente, pedido).catch(e => console.error(e));
     });
-}
+
 
 // Reutilizamos tu Worker existente
 async function processOrderBackground(jobId, cliente, pedido) {
