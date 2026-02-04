@@ -1,5 +1,5 @@
 // =========================================================
-// SERVER.JS - ETHERE4L BACKEND (PRODUCTION MASTER - NaN FIXED)
+// SERVER.JS - ETHERE4L BACKEND (FULL PRODUCTION - PHASE 5 HYDRATION FIXED)
 // =========================================================
 
 // Cargar variables de entorno solo en local
@@ -45,10 +45,6 @@ const magicLinkLimiter = rateLimit({
     max: 5,
     message: "Demasiadas solicitudes. Intenta más tarde."
 });
-
-
-
-
 
 // ===============================
 // 0.1 HELPER: SANITIZACIÓN NUMÉRICA (NUEVO - FIX NaN)
@@ -132,46 +128,47 @@ try {
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     `);
-// ===============================
-// MIGRACIÓN SEGURA DE COLUMNAS (Railway-safe)
-// ===============================
-try {
-    const columns = db
-        .prepare(`PRAGMA table_info(pedidos)`)
-        .all()
-        .map(col => col.name);
+    
+    // ===============================
+    // MIGRACIÓN SEGURA DE COLUMNAS (Railway-safe)
+    // ===============================
+    try {
+        const columns = db
+            .prepare(`PRAGMA table_info(pedidos)`)
+            .all()
+            .map(col => col.name);
 
-    if (!columns.includes('tracking_number')) {
-        db.exec(`ALTER TABLE pedidos ADD COLUMN tracking_number TEXT`);
-        console.log('🧱 Columna tracking_number añadida');
+        if (!columns.includes('tracking_number')) {
+            db.exec(`ALTER TABLE pedidos ADD COLUMN tracking_number TEXT`);
+            console.log('🧱 Columna tracking_number añadida');
+        }
+
+        if (!columns.includes('shipping_cost')) {
+            db.exec(`ALTER TABLE pedidos ADD COLUMN shipping_cost REAL`);
+            console.log('🧱 Columna shipping_cost añadida');
+        }
+
+        if (!columns.includes('shipping_status')) {
+            db.exec(`ALTER TABLE pedidos ADD COLUMN shipping_status TEXT DEFAULT 'CONFIRMADO'`);
+            console.log('🧱 Columna shipping_status añadida');
+        }
+
+        if (!columns.includes('shipping_history')) {
+            db.exec(`ALTER TABLE pedidos ADD COLUMN shipping_history TEXT`);
+            console.log('🧱 Columna shipping_history añadida');
+        }
+
+        if (!columns.includes('carrier_code')) {
+            db.exec(`ALTER TABLE pedidos ADD COLUMN carrier_code TEXT`);
+            console.log('🧱 Columna carrier_code añadida');
+        }
+
+    } catch (e) {
+        console.error('⚠️ Error en migración segura:', e.message);
     }
 
-    if (!columns.includes('shipping_cost')) {
-        db.exec(`ALTER TABLE pedidos ADD COLUMN shipping_cost REAL`);
-        console.log('🧱 Columna shipping_cost añadida');
-    }
-
-    if (!columns.includes('shipping_status')) {
-        db.exec(`ALTER TABLE pedidos ADD COLUMN shipping_status TEXT DEFAULT 'CONFIRMADO'`);
-        console.log('🧱 Columna shipping_status añadida');
-    }
-
-    if (!columns.includes('shipping_history')) {
-        db.exec(`ALTER TABLE pedidos ADD COLUMN shipping_history TEXT`);
-        console.log('🧱 Columna shipping_history añadida');
-    }
-
-    if (!columns.includes('carrier_code')) {
-        db.exec(`ALTER TABLE pedidos ADD COLUMN carrier_code TEXT`);
-        console.log('🧱 Columna carrier_code añadida');
-    }
-
-} catch (e) {
-    console.error('⚠️ Error en migración segura:', e.message);
-}
-
-dbPersistent = true;
-console.log('✅ DB Conectada y Persistente');
+    dbPersistent = true;
+    console.log('✅ DB Conectada y Persistente');
 
 } catch (err) {
     console.error('❌ DB ERROR → SAFE MODE ACTIVO', err);
@@ -181,12 +178,6 @@ console.log('✅ DB Conectada y Persistente');
     };
 }
 
-
-
-
-
-
-    
 
 // ===============================
 // 2. CONFIGURACIÓN APP & RESEND
@@ -208,8 +199,6 @@ const logger = {
     error: (msg, ctx = {}) =>
         console.error(`[ERROR] ${new Date().toISOString()} | ${msg} | ${JSON.stringify(ctx)}`)
 };
-
-
 
 const PORT = process.env.PORT || 3000;
 
@@ -263,8 +252,9 @@ app.use(cors({
     origin: [
         'https://ethereal-frontend.netlify.app',
         'http://localhost:5500',
-        'http://127.0.0.1:5500'
-    ],
+        'http://127.0.0.1:5500',
+        process.env.FRONTEND_URL 
+    ].filter(Boolean),
     methods: ['GET', 'POST', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization']
 }));
@@ -318,16 +308,15 @@ app.get('/', (req, res) => {
 });
 
 
-
-// --- NUEVO: CREAR SESIÓN DE PAGO (CORREGIDO ERR_INVALID_CHAR + NaN FIX) ---
+// --- NUEVO: CREAR SESIÓN DE PAGO (CORREGIDO ERR_INVALID_CHAR + NaN FIX + HYDRATION) ---
 app.post('/api/create-checkout-session', async (req, res) => {
     try {
         const { items, customer } = req.body;
-
+        
+        // 1. GENERAR ID DE ORDEN AQUÍ PARA USARLO EN DB Y METADATA
         const tempOrderId = `ord_${Date.now()}_${Math.random().toString(36).slice(2,6)}`;
 
-        
-        // 1. DEFINICIÓN SEGURA DEL DOMINIO
+        // DEFINICIÓN SEGURA DEL DOMINIO
         const FRONTEND_URL = process.env.FRONTEND_URL || req.headers.origin || 'https://ethereal-frontend.netlify.app';
 
         let lineItems = [];
@@ -378,118 +367,87 @@ app.post('/api/create-checkout-session', async (req, res) => {
                 },
                 quantity: parseSafeNumber(item.cantidad, 1),
             });
-            }
-
-
-
-
-        // 3. Calcular Envío Logístico
-        // ... (dentro de /api/create-checkout-session, después del loop for)
+        } // Fin del for
 
         // 3. LOGICA DE ENVÍO COMERCIAL (Items + Peso)
         // Regla: 1 item ($45 USD), 2 items ($50 USD), 3 items ($65 USD), 4+ (Tarifa plana/gratis)
-        // Asumiendo TC aprox 20 MXN por USD
-        
         const totalItems = items.reduce((acc, item) => acc + item.cantidad, 0);
         let costoEnvio = 0;
 
         if (totalItems === 1) {
-            costoEnvio = 900; // ~$45 USD (Envío unitario caro)
+            costoEnvio = 900; 
         } else if (totalItems === 2) {
-            costoEnvio = 1000; // ~$50 USD (Baja considerablemente por pieza)
+            costoEnvio = 1000; 
         } else if (totalItems === 3) {
-            costoEnvio = 1300; // ~$65 USD
+            costoEnvio = 1300; 
         } else {
-            // 4+ Piezas (Lote grande): 
-            // Opción A: Cobrar un cap (ej. 1500 MXN)
-            // Opción B: Envío Gratis (descomentar si aplica)
-            // costoEnvio = 0; 
-            costoEnvio = 1500; // ~$75 USD Cap de Heavy Haul
+            costoEnvio = 1500; 
         }
 
         // Safety Check: Si el peso es extraordinario (>10kg) cobrar extra
         if (pesoTotal > 10.0) {
-            costoEnvio += 500; // Sobrecargo por exceso de dimensiones
-        }
-
-        // ... (continuar con session = await stripe...)
-
-
-        if (customer) {
-            metadata.customer_email = customer.email || '';
-            try {
-                const customerString = JSON.stringify(customer);
-                if (customerString.length < 450) {
-                    metadata.customer_info = customerString;
-                } else {
-                    metadata.customer_info = JSON.stringify({
-                        nombre: customer.nombre,
-                        email: customer.email
-                    });
-                }
-            } catch (e) {
-                console.warn("Error serializando metadata cliente", e);
-            }
+            costoEnvio += 500; 
         }
 
         // ===============================
-// SNAPSHOT REAL DEL PEDIDO (DB SOURCE OF TRUTH)
-// ===============================
+        // SNAPSHOT REAL DEL PEDIDO (DB SOURCE OF TRUTH)
+        // ===============================
+        const pedidoSnapshot = {
+            items: items.map(item => {
+                const dbProduct = PRODUCTS_DB.find(p => String(p.id) === String(item.id)) || item;
+                const precio = parseSafeNumber(dbProduct.precio || item.precio, 0);
 
-const pedidoSnapshot = {
-    items: items.map(item => {
-        const dbProduct = PRODUCTS_DB.find(p => String(p.id) === String(item.id)) || item;
-        const precio = parseSafeNumber(dbProduct.precio || item.precio, 0);
-
-        return {
-            id: item.id,
-            nombre: dbProduct.nombre || item.nombre,
-            imagen: (dbProduct.fotos && dbProduct.fotos[0]) || item.imagen || null,
-            talla: item.talla || null,
-            cantidad: item.cantidad,
-            precio,
-            subtotal: precio * item.cantidad
+                return {
+                    id: item.id,
+                    nombre: dbProduct.nombre || item.nombre,
+                    imagen: (dbProduct.fotos && dbProduct.fotos[0]) || item.imagen || null,
+                    talla: item.talla || null,
+                    cantidad: item.cantidad,
+                    precio: precio,
+                    subtotal: precio * item.cantidad
+                };
+            }),
+            subtotal: items.reduce(
+                (sum, i) => sum + (parseSafeNumber(i.precio) * i.cantidad), 0
+            ),
+            envio: costoEnvio,
+            total: items.reduce(
+                (sum, i) => sum + (parseSafeNumber(i.precio) * i.cantidad), 0
+            ) + costoEnvio
         };
-    }),
-    subtotal: items.reduce(
-        (sum, i) => sum + (parseSafeNumber(i.precio) * i.cantidad), 0
-    ),
-    envio: costoEnvio,
-    total: items.reduce(
-        (sum, i) => sum + (parseSafeNumber(i.precio) * i.cantidad), 0
-    ) + costoEnvio
-};
 
-
-
-db.prepare(`
-    INSERT INTO pedidos (id, email, data, status, shipping_cost)
-    VALUES (?, ?, ?, 'PENDIENTE', ?)
-`).run(
-    tempOrderId,
-    customer?.email || '',
-    JSON.stringify({
-        cliente: customer,
-        pedido: pedidoSnapshot
-    }),
-    costoEnvio
-);
-
-
-
-
+        // ============================================
+        // 🚨 GUARDAR EN DB AHORA (ANTES DE STRIPE)
+        // ============================================
+        if (dbPersistent) {
+            db.prepare(`
+                INSERT INTO pedidos (id, email, data, status, shipping_cost)
+                VALUES (?, ?, ?, 'PENDIENTE', ?)
+            `).run(
+                tempOrderId,
+                customer?.email || '',
+                JSON.stringify({
+                    cliente: customer,
+                    pedido: pedidoSnapshot
+                }),
+                costoEnvio
+            );
+            console.log(`✅ Pedido ${tempOrderId} guardado PRE-PAGO en DB.`);
+        }
 
         // 5. Crear Sesión Stripe
         const session = await stripe.checkout.sessions.create({
-                payment_method_types: ['card'],
-                line_items: lineItems,
-                mode: 'payment',
-                customer_email: customer?.email,
-                metadata: {
-                order_id: tempOrderId},
-                shipping_options: [
-                    {
-                        shipping_rate_data: {
+            payment_method_types: ['card'],
+            line_items: lineItems,
+            mode: 'payment',
+            customer_email: customer?.email,
+            // ⚠️ FIX: Solo pasamos order_id. La data ya está en DB.
+            metadata: {
+                order_id: tempOrderId 
+            },
+            shipping_options: [
+                {
+                    shipping_rate_data: {
                         type: 'fixed_amount',
                         fixed_amount: { amount: costoEnvio * 100, currency: 'mxn' },
                         display_name: 'Envío Logístico Privado (Tracked)',
@@ -551,7 +509,7 @@ app.get('/api/orders/track/:orderId', trackingLimiter, (req, res) => {
 
     // 🔎 Buscar pedido
     const orderRow = db.prepare(`
-        SELECT id, email, status, tracking_number, shipping_cost, data
+        SELECT id, email, status, shipping_status, tracking_number, carrier_code, shipping_cost, data, created_at, shipping_history
         FROM pedidos
         WHERE id = ?
     `).get(orderId);
@@ -560,12 +518,10 @@ app.get('/api/orders/track/:orderId', trackingLimiter, (req, res) => {
         return res.status(404).json({ error: 'Orden no encontrada' });
     }
 
-
-    // 🔒 Seguridad: token debe corresponder al pedido
-    if (decoded.o !== orderId || decoded.e !== orderRow.email) {
+    // 🔒 Seguridad: token debe corresponder al pedido (o ser admin)
+    if (decoded.role !== 'admin' && (decoded.o !== orderId || decoded.e !== orderRow.email)) {
         return res.status(403).json({ error: 'Acceso denegado' });
     }
-
 
     // 🧠 Parse defensivo
     let parsedData = {};
@@ -578,10 +534,11 @@ app.get('/api/orders/track/:orderId', trackingLimiter, (req, res) => {
     res.json({
         id: orderRow.id,
         status: orderRow.shipping_status || 'CONFIRMADO',
+        payment_status: orderRow.status,
         tracking_number: orderRow.tracking_number,
         carrier: orderRow.carrier_code || null,
-        tracking_history: orderRow.tracking_history
-            ? JSON.parse(orderRow.tracking_history)
+        tracking_history: orderRow.shipping_history
+            ? JSON.parse(orderRow.shipping_history)
             : [],
         shipping_cost: orderRow.shipping_cost,
         data: orderRow.data, // 👈 necesario para tu hydration layer
@@ -746,7 +703,7 @@ app.get('/api/admin/orders', verifyToken, (req, res) => {
 
 // Actualizar Tracking (Protegido + Trigger Email)
 app.post('/api/admin/update-shipping', verifyToken, async (req, res) => {
-    const { orderId, status, trackingNumber, carrier } = req.body;
+    const { orderId, status, trackingNumber, carrier, description } = req.body; // Added description
 
     const VALID_STATUSES = [
         'CONFIRMADO',
@@ -762,16 +719,17 @@ app.post('/api/admin/update-shipping', verifyToken, async (req, res) => {
     const order = db.prepare(`SELECT * FROM pedidos WHERE id=?`).get(orderId);
     if (!order) return res.status(404).json({ error: 'Orden no encontrada' });
 
-    const history = order.shipping_history
-        ? JSON.parse(order.shipping_history)
-        : [];
+    let history = [];
+    try {
+         history = order.shipping_history ? JSON.parse(order.shipping_history) : [];
+    } catch(e) { history = []; }
 
-        history.unshift({
-            status,
-            description,
-            timestamp: new Date().toISOString(),
-            location: ''
-        });
+    history.unshift({
+        status,
+        description: description || getStatusDescription(status),
+        timestamp: new Date().toISOString(),
+        location: ''
+    });
 
 
     db.prepare(`
@@ -826,122 +784,89 @@ function getStatusDescription(status) {
 
 // Manejo post-pago de Stripe
 async function handleStripeSuccess(session) {
+    // 1. OBTENER ID REAL DEL METADATA
     const orderId = session.metadata?.order_id;
     if (!orderId) {
-        console.error('❌ Webhook sin order_id');
+        console.error('❌ Webhook Critical: No order_id in metadata');
         return;
     }
 
     if (!dbPersistent) return;
 
-    db.prepare(`
-        UPDATE pedidos
-        SET 
-            status = 'PAGADO',
-            payment_ref = ?,
-            paid_at = datetime('now')
-        WHERE id = ?
-    `).run(
-        session.payment_intent,
-        orderId
-    );
+    // 2. ACTUALIZAR ESTADO A PAGADO
+    try {
+        db.prepare(`
+            UPDATE pedidos
+            SET 
+                status = 'PAGADO',
+                payment_ref = ?,
+                paid_at = datetime('now')
+            WHERE id = ?
+        `).run(
+            session.payment_intent,
+            orderId
+        );
 
-    const row = db.prepare(`SELECT data FROM pedidos WHERE id=?`).get(orderId);
-    if (!row) return;
-
-    const parsed = JSON.parse(row.data);
-    const cliente = parsed.cliente;
-    const pedido = parsed.pedido;
-
-    setImmediate(() => {
-        processOrderBackground(orderId, cliente, pedido)
-            .catch(e => console.error(e));
-    });
-}
-
-    
-    // 1. RECONSTRUCCIÓN INTELIGENTE DEL CLIENTE
-    let cliente = {};
-    if (session.metadata.customer_info) {
-        try {
-            cliente = JSON.parse(session.metadata.customer_info);
-            cliente.email = email; 
-        } catch (e) {
-            console.warn("Error parseando customer_info de metadata", e);
+        // 3. RECUPERAR DATOS COMPLETOS DE LA DB (Hydration Source)
+        const row = db.prepare(`SELECT data FROM pedidos WHERE id=?`).get(orderId);
+        if (!row) {
+            console.error(`❌ Pedido ${orderId} no encontrado en DB tras pago.`);
+            return;
         }
+
+        let parsed = {};
+        parsed = JSON.parse(row.data);
+        
+        const cliente = parsed.cliente;
+        const pedido = parsed.pedido;
+
+        console.log(`💰 Pago procesado correctamente para ${orderId}`);
+
+        // 4. GENERAR PDF Y CORREOS (BACKGROUND)
+        setImmediate(() => {
+            processOrderBackground(orderId, cliente, pedido)
+                .catch(e => console.error("Background Worker Error:", e));
+        });
+
+    } catch (e) {
+        console.error("❌ Error en handleStripeSuccess DB Update:", e);
     }
-
-    if (!cliente.nombre) cliente.nombre = session.customer_details.name;
-    if (!cliente.direccion) cliente.direccion = session.customer_details.address;
-    if (!cliente.email) cliente.email = email;
-
-    // 2. Guardar en DB
-    if (dbPersistent) {
-        try {
-            if (!exists) {
-                db.prepare(`
-                    UPDATE pedidos
-                    SET 
-                    status = 'PAGADO',
-                    payment_ref = ?,
-                    paid_at = datetime('now')
-                    WHERE id = ?
-                    `).run(
-                        session.payment_intent,
-                        orderId
-                    );
-                    const row = db.prepare(`SELECT data FROM pedidos WHERE id=?`).get(orderId);
-                    const parsed = JSON.parse(row.data);
-                    const cliente = parsed.cliente;
-                    const pedido = parsed.pedido;
-
-
-                console.log(`💰 Pago registrado y guardado: ${jobId}`);
-            }
-            } catch (e) {
-                logger.error('DB_WRITE_ERROR', {
-                    orderId: jobId,
-                    error: e.message
-    });
 }
-
-    }
-
-    // 3. Generar PDF y Enviar Emails
-    setImmediate(() => {
-    });
-
 
 // Reutilizamos tu Worker existente
 async function processOrderBackground(jobId, cliente, pedido) {
-    const pdfBuffer = await buildPDF(cliente, pedido, jobId, 'CLIENTE');
+    try {
+        const pdfBuffer = await buildPDF(cliente, pedido, jobId, 'CLIENTE');
 
-    const accessToken = generateOrderToken(jobId, cliente.email);
-    const FRONTEND_URL = process.env.FRONTEND_URL || 'https://ethereal-frontend.netlify.app';
-    const trackingUrl = `${FRONTEND_URL}/pedido.html?order=${jobId}&token=${accessToken}`;
+        const accessToken = generateOrderToken(jobId, cliente.email);
+        const FRONTEND_URL = process.env.FRONTEND_URL || 'https://ethereal-frontend.netlify.app';
+        const trackingUrl = `${FRONTEND_URL}/pedido.html?order=${jobId}&token=${accessToken}`;
 
-    if (resend) {
-        await resend.emails.send({
-            from: `ETHERE4L <${SENDER_EMAIL}>`,
-            to: [cliente.email],
-            subject: `Confirmación de Pedido ${jobId.slice(-6)}`,
-            html: getPaymentConfirmedEmail(cliente, pedido, jobId, trackingUrl),
-            attachments: [
-                { filename: `Orden_${jobId.slice(-6)}.pdf`, content: pdfBuffer }
-            ]
-        });
-
-        if (ADMIN_EMAIL) {
+        if (resend) {
             await resend.emails.send({
-                from: `System <${SENDER_EMAIL}>`,
-                to: [ADMIN_EMAIL],
-                subject: `💰 NUEVA VENTA - ${jobId.slice(-6)}`,
-                html: getEmailTemplate(cliente, pedido, jobId, true),
+                from: `ETHERE4L <${SENDER_EMAIL}>`,
+                to: [cliente.email],
+                subject: `Confirmación de Pedido ${jobId.slice(-6)}`,
+                html: getPaymentConfirmedEmail(cliente, pedido, jobId, trackingUrl),
                 attachments: [
                     { filename: `Orden_${jobId.slice(-6)}.pdf`, content: pdfBuffer }
                 ]
             });
+
+            if (ADMIN_EMAIL) {
+                await resend.emails.send({
+                    from: `System <${SENDER_EMAIL}>`,
+                    to: [ADMIN_EMAIL],
+                    subject: `💰 NUEVA VENTA - ${jobId.slice(-6)}`,
+                    html: getEmailTemplate(cliente, pedido, jobId, true),
+                    attachments: [
+                        { filename: `Orden_${jobId.slice(-6)}.pdf`, content: pdfBuffer }
+                    ]
+                });
+            }
         }
+    } catch (e) {
+        console.error("❌ Error sending background emails/pdf:", e);
     }
 }
 
@@ -956,6 +881,3 @@ const server = app.listen(PORT, '0.0.0.0', () => {
 process.on('SIGTERM', () => {
     server.close(() => console.log('Servidor cerrado.'));
 });
-
-
-
