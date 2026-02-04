@@ -448,63 +448,76 @@ app.post('/api/crear-pedido', (req, res) => {
 });
 
 
-
-
-
 // ===============================
-// 4.1 API TRACKING PASSWORDLESS
+// 4.1 API TRACKING (SESSION-LOCKED)
 // ===============================
 const trackingLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 50,
-    message: "Demasiados intentos de acceso."
+    message: "Demasiadas solicitudes de tracking."
 });
 
 app.get('/api/orders/track/:orderId', trackingLimiter, (req, res) => {
     const { orderId } = req.params;
-    const { token } = req.query;
 
-    if (!token) return res.status(401).json({ error: "Token requerido" });
-
-    try {
-        const decoded = jwt.verify(token, JWT_SECRET);
-
-        if (decoded.o !== orderId) {
-            return res.status(403).json({ error: "Token inválido" });
-        }
-
-        if (!dbPersistent) {
-            return res.status(503).json({ error: "DB no disponible" });
-        }
-
-        const orderRow = db.prepare("SELECT * FROM pedidos WHERE id=?").get(orderId);
-
-        if (!orderRow) return res.status(404).json({ error: "Orden no encontrada" });
-
-        if (orderRow.email !== decoded.e) {
-            return res.status(403).json({ error: "Acceso denegado" });
-        }
-
-        const orderData = JSON.parse(orderRow.data);
-
-        res.json({
-            id: orderRow.id,
-            created_at: orderRow.created_at,
-            status: orderRow.status,
-            tracking_number: orderRow.tracking_number,
-            shipping_cost: orderRow.shipping_cost,
-            items: orderData.pedido.items,
-            total: orderData.pedido.total,
-            cliente: {
-                nombre: orderData.cliente.nombre,
-                direccion: orderData.cliente.direccion
-            }
-        });
-
-    } catch (err) {
-        return res.status(401).json({ error: "Enlace expirado o inválido" });
+    // 🔐 Authorization Header obligatorio
+    const authHeader = req.headers.authorization;
+    if (!authHeader) {
+        return res.status(401).json({ error: 'Authorization requerido' });
     }
+
+    const token = authHeader.split(' ')[1];
+
+    let decoded;
+    try {
+        decoded = jwt.verify(token, JWT_SECRET);
+    } catch {
+        return res.status(401).json({ error: 'Token inválido o expirado' });
+    }
+
+    if (!dbPersistent) {
+        return res.status(503).json({ error: 'DB no disponible' });
+    }
+
+    // 🔎 Buscar pedido
+    const orderRow = db.prepare(`
+        SELECT id, email, status, tracking_number, shipping_cost, data
+        FROM pedidos
+        WHERE id = ?
+    `).get(orderId);
+
+    if (!orderRow) {
+        return res.status(404).json({ error: 'Orden no encontrada' });
+    }
+
+    // 🔒 Seguridad: el pedido debe pertenecer al email del token
+    if (orderRow.email !== decoded.email && decoded.scope !== 'read_orders') {
+        return res.status(403).json({ error: 'Acceso denegado' });
+    }
+
+    // 🧠 Parse defensivo
+    let parsedData = {};
+    try {
+        parsedData = JSON.parse(orderRow.data);
+    } catch {
+        parsedData = {};
+    }
+
+    res.json({
+        id: orderRow.id,
+        status: orderRow.status,
+        tracking_number: orderRow.tracking_number,
+        carrier: orderRow.carrier_code || null,
+        tracking_history: orderRow.tracking_history
+            ? JSON.parse(orderRow.tracking_history)
+            : [],
+        shipping_cost: orderRow.shipping_cost,
+        data: orderRow.data, // 👈 necesario para tu hydration layer
+        total: parsedData?.pedido?.total || 0,
+        date: orderRow.created_at
+    });
 });
+
 
 
 // ===============================
@@ -632,7 +645,6 @@ app.get('/api/my-orders', (req, res) => {
                 date: row.created_at,
                 total: parsed.pedido.total,
                 item_count: parsed.pedido.items.length,
-                items_summary: parsed.pedido.items.map(i => i.nombre).join(', '),
                 tracking_number: row.tracking_number,
                 access_token: orderToken
             };
