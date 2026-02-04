@@ -132,11 +132,10 @@ try {
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     `);
-
-    // ===============================
-    // MIGRACIÓN SEGURA DE COLUMNAS (Railway-safe)
-    // ===============================
-    try {
+// ===============================
+// MIGRACIÓN SEGURA DE COLUMNAS (Railway-safe)
+// ===============================
+try {
     const columns = db
         .prepare(`PRAGMA table_info(pedidos)`)
         .all()
@@ -146,7 +145,8 @@ try {
         db.exec(`ALTER TABLE pedidos ADD COLUMN tracking_number TEXT`);
         console.log('🧱 Columna tracking_number añadida');
     }
-     if (!columns.includes('shipping_cost')) {
+
+    if (!columns.includes('shipping_cost')) {
         db.exec(`ALTER TABLE pedidos ADD COLUMN shipping_cost REAL`);
         console.log('🧱 Columna shipping_cost añadida');
     }
@@ -160,13 +160,28 @@ try {
         db.exec(`ALTER TABLE pedidos ADD COLUMN shipping_history TEXT`);
         console.log('🧱 Columna shipping_history añadida');
     }
-} catch (e) {
-    console.error('⚠️ Error en migración segura:', e.message);
-}
+
     if (!columns.includes('carrier_code')) {
         db.exec(`ALTER TABLE pedidos ADD COLUMN carrier_code TEXT`);
         console.log('🧱 Columna carrier_code añadida');
+    }
+
+} catch (e) {
+    console.error('⚠️ Error en migración segura:', e.message);
 }
+
+dbPersistent = true;
+console.log('✅ DB Conectada y Persistente');
+
+} catch (err) {
+    console.error('❌ DB ERROR → SAFE MODE ACTIVO', err);
+    db = {
+        prepare: () => ({ run: () => {}, get: () => null, all: () => [] }),
+        exec: () => {}
+    };
+}
+
+
 
 
 
@@ -869,7 +884,6 @@ const server = app.listen(PORT, '0.0.0.0', () => {
 process.on('SIGTERM', () => {
     server.close(() => console.log('Servidor cerrado.'));
 });
-
 
 
 
