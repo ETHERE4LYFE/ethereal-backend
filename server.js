@@ -657,10 +657,7 @@ app.get('/api/my-orders', (req, res) => {
         const response = orders.map(row => {
             const parsed = JSON.parse(row.data);
 
-            const orderToken = generateOrderToken(
-                row.id,
-                decoded.email
-            );
+            const orderToken = generateOrderToken(row.id,decoded.email);
 
             return {
                 id: row.id,
@@ -720,11 +717,13 @@ app.post('/api/admin/update-shipping', verifyToken, async (req, res) => {
         ? JSON.parse(order.shipping_history)
         : [];
 
-    history.unshift({
-        status,
-        description: getStatusDescription(status),
-        date: new Date().toISOString()
-    });
+        history.unshift({
+            status,
+            description,
+            timestamp: new Date().toISOString(),
+            location: ''
+        });
+
 
     db.prepare(`
         UPDATE pedidos
