@@ -132,40 +132,46 @@ try {
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     `);
-    
+
     // ===============================
     // MIGRACIÓN SEGURA DE COLUMNAS (Railway-safe)
     // ===============================
     try {
-        const columns = db
-            .prepare(`PRAGMA table_info(pedidos)`)
-            .all()
-            .map(col => col.name);
+    const columns = db
+        .prepare(`PRAGMA table_info(pedidos)`)
+        .all()
+        .map(col => col.name);
 
-        if (!columns.includes('tracking_number')) {
-            db.exec(`ALTER TABLE pedidos ADD COLUMN tracking_number TEXT`);
-            console.log('🧱 Columna tracking_number añadida');
-        }
-
-        if (!columns.includes('shipping_cost')) {
-            db.exec(`ALTER TABLE pedidos ADD COLUMN shipping_cost REAL`);
-            console.log('🧱 Columna shipping_cost añadida');
-        }
-    } catch (e) {
-        console.error('⚠️ Error en migración segura:', e.message);
+    if (!columns.includes('tracking_number')) {
+        db.exec(`ALTER TABLE pedidos ADD COLUMN tracking_number TEXT`);
+        console.log('🧱 Columna tracking_number añadida');
+    }
+     if (!columns.includes('shipping_cost')) {
+        db.exec(`ALTER TABLE pedidos ADD COLUMN shipping_cost REAL`);
+        console.log('🧱 Columna shipping_cost añadida');
     }
 
+    if (!columns.includes('shipping_status')) {
+        db.exec(`ALTER TABLE pedidos ADD COLUMN shipping_status TEXT DEFAULT 'CONFIRMADO'`);
+        console.log('🧱 Columna shipping_status añadida');
+    }
 
-
-    dbPersistent = true;
-    console.log('✅ DB Conectada y Persistente');
-} catch (err) {
-    console.error('❌ DB ERROR → SAFE MODE ACTIVO', err);
-    db = {
-        prepare: () => ({ run: () => {}, get: () => null, all: () => [] }),
-        exec: () => {}
-    };
+    if (!columns.includes('shipping_history')) {
+        db.exec(`ALTER TABLE pedidos ADD COLUMN shipping_history TEXT`);
+        console.log('🧱 Columna shipping_history añadida');
+    }
+} catch (e) {
+    console.error('⚠️ Error en migración segura:', e.message);
 }
+    if (!columns.includes('carrier_code')) {
+        db.exec(`ALTER TABLE pedidos ADD COLUMN carrier_code TEXT`);
+        console.log('🧱 Columna carrier_code añadida');
+}
+
+
+
+
+    
 
 // ===============================
 // 2. CONFIGURACIÓN APP & RESEND
@@ -490,10 +496,12 @@ app.get('/api/orders/track/:orderId', trackingLimiter, (req, res) => {
         return res.status(404).json({ error: 'Orden no encontrada' });
     }
 
-    // 🔒 Seguridad: el pedido debe pertenecer al email del token
-    if (orderRow.email !== decoded.email && decoded.scope !== 'read_orders') {
+
+    // 🔒 Seguridad: token debe corresponder al pedido
+    if (decoded.o !== orderId || decoded.e !== orderRow.email) {
         return res.status(403).json({ error: 'Acceso denegado' });
     }
+
 
     // 🧠 Parse defensivo
     let parsedData = {};
@@ -505,7 +513,7 @@ app.get('/api/orders/track/:orderId', trackingLimiter, (req, res) => {
 
     res.json({
         id: orderRow.id,
-        status: orderRow.status,
+        status: orderRow.shipping_status || 'CONFIRMADO',
         tracking_number: orderRow.tracking_number,
         carrier: orderRow.carrier_code || null,
         tracking_history: orderRow.tracking_history
@@ -676,43 +684,78 @@ app.get('/api/admin/orders', verifyToken, (req, res) => {
 });
 
 // Actualizar Tracking (Protegido + Trigger Email)
-app.post('/api/admin/update-tracking', verifyToken, async (req, res) => {
-    const { orderId, trackingNumber } = req.body;
-    try {
-        const info = db.prepare(`
-            UPDATE pedidos 
-            SET tracking_number=?, status='ENVIADO' 
-            WHERE id=?
-        `).run(trackingNumber, orderId);
+app.post('/api/admin/update-shipping', verifyToken, async (req, res) => {
+    const { orderId, status, trackingNumber, carrier } = req.body;
 
-        if (info.changes > 0) {
-            const order = db.prepare("SELECT * FROM pedidos WHERE id=?").get(orderId);
-            if (resend) {
-                await resend.emails.send({
-                    from: `ETHERE4L Logistics <${SENDER_EMAIL}>`,
-                    to: [order.email],
-                    subject: `Tu pedido ha sido enviado - ${orderId}`,
-                    html: `
-                        <div style="font-family: sans-serif; color: #333;">
-                            <h1>Logística Iniciada</h1>
-                            <p>Tu pedido <strong>${orderId}</strong> está en camino.</p>
-                            <div style="background:#f4f4f4; padding:15px; margin:20px 0;">
-                                <strong>Tracking ID:</strong> ${trackingNumber}<br>
-                                <strong>Carrier:</strong> J&T Express / Private Line
-                            </div>
-                            <p>Puedes rastrearlo en nuestra web o directamente con la paquetería.</p>
-                        </div>
-                    `
-                });
-            }
-            res.json({ success: true });
-        } else {
-            res.status(404).json({ error: "Orden no encontrada" });
-        }
-    } catch (e) {
-        res.status(500).json({ error: e.message });
+    const VALID_STATUSES = [
+        'CONFIRMADO',
+        'EMPAQUETADO',
+        'EN_TRANSITO',
+        'ENTREGADO'
+    ];
+
+    if (!VALID_STATUSES.includes(status)) {
+        return res.status(400).json({ error: 'Estado inválido' });
     }
+
+    const order = db.prepare(`SELECT * FROM pedidos WHERE id=?`).get(orderId);
+    if (!order) return res.status(404).json({ error: 'Orden no encontrada' });
+
+    const history = order.shipping_history
+        ? JSON.parse(order.shipping_history)
+        : [];
+
+    history.unshift({
+        status,
+        description: getStatusDescription(status),
+        date: new Date().toISOString()
+    });
+
+    db.prepare(`
+        UPDATE pedidos
+        SET 
+            shipping_status = ?,
+            shipping_history = ?,
+            tracking_number = COALESCE(?, tracking_number),
+            carrier_code = COALESCE(?, carrier_code)
+        WHERE id = ?
+    `).run(
+        status,
+        JSON.stringify(history),
+        trackingNumber,
+        carrier,
+        orderId
+    );
+
+    // 📧 EMAIL AUTOMÁTICO
+    if (resend) {
+        await resend.emails.send({
+            from: `ETHERE4L <${SENDER_EMAIL}>`,
+            to: [order.email],
+            subject: `Actualización de tu pedido`,
+            html: `
+                <h2>Estado actualizado</h2>
+                <p><strong>${getStatusDescription(status)}</strong></p>
+                <p>Pedido: ${orderId}</p>
+                ${trackingNumber ? `<p>Guía: ${trackingNumber}</p>` : ''}
+            `
+        });
+    }
+
+    res.json({ success: true });
 });
+
+function getStatusDescription(status) {
+    switch (status) {
+        case 'CONFIRMADO': return 'Pago confirmado, preparando pedido';
+        case 'EMPAQUETADO': return 'Pedido empaquetado';
+        case 'EN_TRANSITO': return 'Pedido en camino';
+        case 'ENTREGADO': return 'Pedido entregado';
+        default: return '';
+    }
+}
+
+
 
 // ===============================
 // 6. FUNCIONES INTERNAS (WEBHOOK LOGIC)
