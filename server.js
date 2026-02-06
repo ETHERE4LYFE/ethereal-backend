@@ -72,6 +72,47 @@ function generateOrderToken(orderId, email) {
         { expiresIn: '7d' }
     );
 }
+const crypto = require('crypto');
+const { v4: uuidv4 } = require('uuid');
+
+const CUSTOMER_SESSION_DAYS = 180;
+
+function hashToken(token) {
+    return crypto.createHash('sha256').update(token).digest('hex');
+}
+
+function createCustomerSession(email, req) {
+    const sessionId = uuidv4();
+
+    const expiresAt = new Date();
+    expiresAt.setDate(expiresAt.getDate() + CUSTOMER_SESSION_DAYS);
+
+    const payload = {
+        email,
+        session_id: sessionId,
+        scope: 'customer'
+    };
+
+    const token = jwt.sign(payload, JWT_SECRET, {
+        expiresIn: `${CUSTOMER_SESSION_DAYS}d`
+    });
+
+    db.prepare(`
+        INSERT INTO customer_sessions
+        (id, email, token_hash, expires_at, user_agent, ip)
+        VALUES (?, ?, ?, ?, ?, ?)
+    `).run(
+        sessionId,
+        email,
+        hashToken(token),
+        expiresAt.toISOString(),
+        req.headers['user-agent'] || '',
+        req.ip
+    );
+
+    return token;
+}
+
 
 
 // ================= CATÁLOGO ESTÁTICO (VALIDACIÓN DE PRECIOS) =================
@@ -128,6 +169,22 @@ try {
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     `);
+    // 2. Tabla Sesiones (CORREGIDO: Ahora dentro de db.exec)
+    db.exec(`
+        CREATE TABLE IF NOT EXISTS customer_sessions (
+            id TEXT PRIMARY KEY,
+            email TEXT NOT NULL,
+            token_hash TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            expires_at DATETIME NOT NULL,
+            user_agent TEXT,
+            ip TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_customer_sessions_email ON customer_sessions(email);
+        CREATE INDEX IF NOT EXISTS idx_customer_sessions_id ON customer_sessions(id);
+    `);
+
+
     
     // ===============================
     // MIGRACIÓN SEGURA DE COLUMNAS (Railway-safe)
@@ -224,6 +281,47 @@ function verifyToken(req, res, next) {
         res.sendStatus(401);
     }
 }
+function verifyCustomerSession(req, res, next) {
+    const auth = req.headers.authorization;
+    if (!auth) return res.sendStatus(401);
+
+    const token = auth.split(' ')[1];
+
+    try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+
+        if (decoded.scope !== 'customer') {
+            return res.sendStatus(403);
+        }
+
+        const session = db.prepare(`
+            SELECT * FROM customer_sessions WHERE id = ?
+        `).get(decoded.session_id);
+
+        if (!session) throw new Error('Session revoked');
+
+        if (new Date() > new Date(session.expires_at)) {
+            db.prepare(`DELETE FROM customer_sessions WHERE id = ?`)
+              .run(decoded.session_id);
+            throw new Error('Session expired');
+        }
+
+        if (hashToken(token) !== session.token_hash) {
+            throw new Error('Token mismatch');
+        }
+
+        req.customer = {
+            email: session.email,
+            session_id: session.id
+        };
+
+        next();
+
+    } catch (e) {
+        return res.sendStatus(403);
+    }
+}
+
 
 
 // ===============================
@@ -640,6 +738,28 @@ app.post('/api/magic-link', magicLinkLimiter, async (req, res) => {
 });
 
 
+app.get('/api/session/start', (req, res) => {
+    const { token } = req.query;
+    if (!token) return res.sendStatus(400);
+
+    try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+
+        if (decoded.scope !== 'read_orders') {
+            return res.sendStatus(403);
+        }
+
+        const customerToken = createCustomerSession(decoded.email, req);
+
+        res.json({ token: customerToken });
+
+    } catch {
+        res.sendStatus(403);
+    }
+});
+
+
+
 app.get('/api/my-orders', (req, res) => {
     const auth = req.headers.authorization;
     if (!auth) return res.sendStatus(401);
@@ -682,7 +802,25 @@ app.get('/api/my-orders', (req, res) => {
         console.error('My orders error:', err);
         res.sendStatus(403);
     }
+
 });
+
+app.get('/api/customer/orders', verifyCustomerSession, (req, res) => {
+    const orders = db.prepare(`
+        SELECT id, status, created_at, data, tracking_number
+        FROM pedidos
+        WHERE email = ?
+        ORDER BY created_at DESC
+    `).all(req.customer.email);
+
+    res.json(
+        orders.map(o => ({
+            ...o,
+            data: JSON.parse(o.data)
+        }))
+    );
+});
+
 
 
 
