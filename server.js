@@ -637,14 +637,17 @@ app.get('/api/orders/track/:orderId', trackingLimiter, (req, res) => {
         tracking_number: orderRow.tracking_number,
         carrier: orderRow.carrier_code || null,
         tracking_history: orderRow.shipping_history
-            ? JSON.parse(orderRow.shipping_history)
-            : [],
+        ? JSON.parse(orderRow.shipping_history)
+        : [],
         shipping_cost: orderRow.shipping_cost,
-        data: orderRow.data, // 👈 necesario para tu hydration layer
+        items: parsedData?.pedido?.items || [], // 🔥 CLAVE
         total: parsedData?.pedido?.total || 0,
         date: orderRow.created_at
     });
+
+    
 });
+
 
 
 
