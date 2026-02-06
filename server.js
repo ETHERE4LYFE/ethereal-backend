@@ -587,7 +587,6 @@ const trackingLimiter = rateLimit({
 app.get('/api/orders/track/:orderId', trackingLimiter, (req, res) => {
     const { orderId } = req.params;
 
-    // 🔐 Authorization Header obligatorio
     const authHeader = req.headers.authorization;
     if (!authHeader) {
         return res.status(401).json({ error: 'Authorization requerido' });
@@ -606,9 +605,9 @@ app.get('/api/orders/track/:orderId', trackingLimiter, (req, res) => {
         return res.status(503).json({ error: 'DB no disponible' });
     }
 
-    // 🔎 Buscar pedido
     const orderRow = db.prepare(`
-        SELECT id, email, status, shipping_status, tracking_number, carrier_code, shipping_cost, data, created_at, shipping_history
+        SELECT id, email, status, shipping_status, tracking_number,
+               carrier_code, shipping_cost, data, created_at, shipping_history
         FROM pedidos
         WHERE id = ?
     `).get(orderId);
@@ -617,35 +616,35 @@ app.get('/api/orders/track/:orderId', trackingLimiter, (req, res) => {
         return res.status(404).json({ error: 'Orden no encontrada' });
     }
 
-    // 🔒 Seguridad: token debe corresponder al pedido (o ser admin)
-    if (decoded.role !== 'admin' && (decoded.o !== orderId || decoded.e !== orderRow.email)) {
+    const isOwner = decoded.o === orderId;
+    const isUser = decoded.email === orderRow.email;
+    const isAdmin = decoded.role === 'admin';
+
+    if (!isOwner && !isUser && !isAdmin) {
         return res.status(403).json({ error: 'Acceso denegado' });
     }
 
-    // 🧠 Parse defensivo
     let parsedData = {};
     try {
         parsedData = JSON.parse(orderRow.data);
     } catch {
-        parsedData = {};
+        parsedData = { pedido: { items: [], total: 0 } };
     }
 
     res.json({
         id: orderRow.id,
         status: orderRow.shipping_status || 'CONFIRMADO',
         payment_status: orderRow.status,
+        date: orderRow.created_at,
         tracking_number: orderRow.tracking_number,
-        carrier: orderRow.carrier_code || null,
+        carrier: orderRow.carrier_code,
+        shipping_cost: orderRow.shipping_cost || 0,
+        total: parsedData.pedido.total || 0,
+        items: parsedData.pedido.items || [],
         tracking_history: orderRow.shipping_history
-        ? JSON.parse(orderRow.shipping_history)
-        : [],
-        shipping_cost: orderRow.shipping_cost,
-        items: parsedData?.pedido?.items || [], // 🔥 CLAVE
-        total: parsedData?.pedido?.total || 0,
-        date: orderRow.created_at
+            ? JSON.parse(orderRow.shipping_history)
+            : []
     });
-
-    
 });
 
 
@@ -785,9 +784,8 @@ app.get('/api/my-orders', (req, res) => {
         `).all(decoded.email);
 
         const response = orders.map(row => {
-            const parsed = JSON.parse(row.data);
 
-            const orderToken = generateOrderToken(row.id,decoded.email);
+        const orderToken = generateOrderToken(row.id,decoded.email);
 
             return {
                 id: row.id,
@@ -1007,7 +1005,8 @@ async function processOrderBackground(jobId, cliente, pedido) {
 
         const accessToken = generateOrderToken(jobId, cliente.email);
         const FRONTEND_URL = process.env.FRONTEND_URL || 'https://ethereal-frontend.netlify.app';
-        const trackingUrl = `${FRONTEND_URL}/pedido.html?order=${jobId}&token=${accessToken}`;
+        const trackingUrl = `${FRONTEND_URL}/pedido-ver.html?id=${jobId}&token=${accessToken}`;
+
 
         if (resend) {
             await resend.emails.send({
