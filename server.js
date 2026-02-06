@@ -833,8 +833,10 @@ app.get('/api/customer/orders', verifyCustomerSession, (req, res) => {
                 created_at: o.created_at,
                 total: pedido.total || 0,
                 shipping: pedido.envio || 0,
-                items: pedido.items || []
-            };
+                items: pedido.items || [],
+                order_token: generateOrderToken(o.id, email) // 🔥 CLAVE
+};
+
         });
 
         res.json(orders);
