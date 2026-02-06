@@ -807,19 +807,42 @@ app.get('/api/my-orders', (req, res) => {
 });
 
 app.get('/api/customer/orders', verifyCustomerSession, (req, res) => {
-    const orders = db.prepare(`
-        SELECT id, status, created_at, data, tracking_number
-        FROM pedidos
-        WHERE email = ?
-        ORDER BY created_at DESC
-    `).all(req.customer.email);
+    try {
+        const email = req.customer.email.toLowerCase();
 
-    res.json(
-        orders.map(o => ({
-            ...o,
-            data: JSON.parse(o.data)
-        }))
-    );
+        const rows = db.prepare(`
+            SELECT id, status, created_at, data
+            FROM pedidos
+            WHERE lower(email) = ?
+            ORDER BY created_at DESC
+        `).all(email);
+
+        const orders = rows.map(o => {
+            let parsed;
+            try {
+                parsed = JSON.parse(o.data);
+            } catch {
+                parsed = { pedido: { total: 0, envio: 0, items: [] } };
+            }
+
+            const pedido = parsed.pedido || {};
+
+            return {
+                id: o.id,
+                status: o.status,
+                created_at: o.created_at,
+                total: pedido.total || 0,
+                shipping: pedido.envio || 0,
+                items: pedido.items || []
+            };
+        });
+
+        res.json(orders);
+
+    } catch (err) {
+        console.error('CUSTOMER_ORDERS_ERROR', err);
+        res.status(500).json([]);
+    }
 });
 
 
