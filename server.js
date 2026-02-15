@@ -1,16 +1,18 @@
 // =========================================================
-// SERVER.JS - ETHERE4L BACKEND (FULL PRODUCTION - PHASE 6 HARDENED)
+// SERVER.JS - ETHERE4L BACKEND (PHASE 0: HTTPONLY COOKIE AUTH)
 // =========================================================
-// CHANGELOG PHASE 6:
-//   ✅ Stock validation + concurrency control (BEGIN IMMEDIATE)
-//   ✅ Email validation RFC 5322
-//   ✅ Persistent JSON file logger (/logs/app.log)
-//   ✅ GET /health — robust health check
-//   ✅ GET /metrics — read-only monitoring
+// CHANGELOG PHASE 0 (SECURITY):
+//   ✅ JWT moved from localStorage to HttpOnly cookie
+//   ✅ Cookie: HttpOnly, Secure, SameSite=None (cross-origin Netlify↔Railway)
+//   ✅ CORS: credentials: true, explicit origin
+//   ✅ POST /api/session/logout — server-side session revocation + cookie clear
+//   ✅ GET /api/session/start — now sets HttpOnly cookie instead of returning JWT
+//   ✅ GET /api/customer/orders — reads from cookie, returns { email, orders }
+//   ✅ verifyCustomerSession reads from cookie OR Authorization header (backward compat)
 //   ✅ All existing endpoints preserved 1:1
-//   ✅ Webhook idempotency preserved
-//   ✅ JWT_SECRET mandatory in production preserved
-//   ✅ All indexes preserved
+//   ✅ Stripe webhook unaffected (server-to-server, no cookies)
+//   ✅ Admin endpoints unaffected (still use Authorization header)
+//   ✅ Per-order tokens (order_token) still via Authorization header (not stored client-side)
 // =========================================================
 
 // Cargar variables de entorno solo en local
@@ -24,6 +26,7 @@ const express = require('express');
 const cors = require('cors');
 const Database = require('better-sqlite3');
 const { Resend } = require('resend');
+const cookieParser = require('cookie-parser');
 
 /* --- DEPENDENCIAS (SEGURIDAD & PAGOS) --- */
 const Stripe = require('stripe');
@@ -44,10 +47,8 @@ const {
 // ===============================
 // 0. CONFIGURACIÓN DE SEGURIDAD
 // ===============================
-// .trim() es vital para evitar errores de conexión con Stripe
 const stripe = Stripe((process.env.STRIPE_SECRET_KEY || '').trim());
 
-// 🛡 FIX #5: JWT_SECRET obligatorio en producción
 const JWT_SECRET = (function() {
     if (process.env.JWT_SECRET) return process.env.JWT_SECRET;
     if (process.env.NODE_ENV === 'production') {
@@ -60,24 +61,63 @@ const JWT_SECRET = (function() {
 const ADMIN_PASS_HASH = process.env.ADMIN_PASS_HASH; 
 const STRIPE_WEBHOOK_SECRET = (process.env.STRIPE_WEBHOOK_SECRET || '').trim();
 
+// ===============================
+// 0.0 COOKIE CONFIGURATION (PHASE 0)
+// ===============================
+const COOKIE_NAME = 'ethere4l_session';
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+
+/**
+ * Returns cookie options for the session cookie.
+ * 
+ * SECURITY RATIONALE:
+ * - httpOnly: true → JavaScript cannot read the cookie (XSS protection)
+ * - secure: true in production → Cookie only sent over HTTPS
+ * - sameSite: 'None' → Required for cross-origin (Netlify frontend ↔ Railway backend)
+ *   NOTE: SameSite=Strict would BLOCK the cookie because frontend and backend are different domains.
+ *   SameSite=None + Secure is the correct combination for cross-origin cookie auth.
+ * - path: '/' → Cookie sent to all API routes
+ * - maxAge: matches session expiry
+ * 
+ * FUTURE: If frontend and backend move to same domain (e.g., api.ethere4l.com),
+ *         switch to SameSite=Strict and set domain='.ethere4l.com'
+ */
+function getSessionCookieOptions(maxAgeDays) {
+    return {
+        httpOnly: true,
+        secure: IS_PRODUCTION,          // HTTPS only in production
+        sameSite: IS_PRODUCTION ? 'None' : 'Lax',  // None for cross-origin prod; Lax for localhost
+        path: '/',
+        maxAge: maxAgeDays * 24 * 60 * 60 * 1000  // Convert days to milliseconds
+    };
+}
+
+/**
+ * Returns cookie options to CLEAR the session cookie.
+ * Must match the options used to SET it (except maxAge).
+ */
+function getClearCookieOptions() {
+    return {
+        httpOnly: true,
+        secure: IS_PRODUCTION,
+        sameSite: IS_PRODUCTION ? 'None' : 'Lax',
+        path: '/'
+    };
+}
+
 // RATE LIMITER: MAGIC LINK
 const magicLinkLimiter = rateLimit({
-    windowMs: 60 * 60 * 1000, // 1 hora
+    windowMs: 60 * 60 * 1000,
     max: 5,
     message: "Demasiadas solicitudes. Intenta más tarde."
 });
 
 // ===============================
-// 0.1 HELPER: SANITIZACIÓN NUMÉRICA (NUEVO - FIX NaN)
+// 0.1 HELPER: SANITIZACIÓN NUMÉRICA
 // ===============================
-/**
- * Convierte cualquier entrada (texto con $, null, undefined) a un número flotante seguro.
- * Evita que Stripe crashee con "Invalid integer: NaN".
- */
 function parseSafeNumber(value, fallback = 0) {
     if (typeof value === 'number' && !isNaN(value)) return value;
     if (!value) return fallback;
-    // Eliminar todo lo que no sea número o punto (ej: "$2,800.00" -> "2800.00")
     const cleanString = String(value).replace(/[^0-9.]/g, '');
     const number = parseFloat(cleanString);
     return isNaN(number) ? fallback : number;
@@ -93,9 +133,9 @@ function generateOrderToken(orderId, email) {
         { expiresIn: '7d' }
     );
 }
+
 const crypto = require('crypto');
 const { randomUUID: uuidv4 } = require('crypto');
-
 
 const CUSTOMER_SESSION_DAYS = 180;
 
@@ -138,25 +178,17 @@ function createCustomerSession(email, req) {
 // ===============================
 // 0.3 HELPER: VALIDACIÓN DE EMAIL (RFC 5322 SIMPLIFICADA)
 // ===============================
-/**
- * Valida email con regex robusta RFC 5322 simplificada.
- * - Max 254 caracteres
- * - Sin espacios
- * - Sin caracteres inválidos
- * - Formato user@domain.tld
- */
 function validateEmail(email) {
     if (!email || typeof email !== 'string') return false;
     const trimmed = email.trim();
     if (trimmed.length === 0 || trimmed.length > 254) return false;
     if (/\s/.test(trimmed)) return false;
-    // RFC 5322 simplified — cubre 99.9% de emails reales
     const emailRegex = /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}$/;
     return emailRegex.test(trimmed);
 }
 
 
-// ================= CATÁLOGO ESTÁTICO (VALIDACIÓN DE PRECIOS) =================
+// ================= CATÁLOGO ESTÁTICO =================
 let PRODUCTS_DB = [];
 let CATALOG_DB = [];
 
@@ -195,7 +227,6 @@ try {
     db = new Database(DB_PATH); 
     db.pragma('journal_mode = WAL');
 
-    // Tabla extendida con campos de tracking
     db.exec(`
         CREATE TABLE IF NOT EXISTS pedidos (
             id TEXT PRIMARY KEY,
@@ -210,7 +241,7 @@ try {
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     `);
-    // 2. Tabla Sesiones (CORREGIDO: Ahora dentro de db.exec)
+
     db.exec(`
         CREATE TABLE IF NOT EXISTS customer_sessions (
             id TEXT PRIMARY KEY,
@@ -225,7 +256,6 @@ try {
         CREATE INDEX IF NOT EXISTS idx_customer_sessions_id ON customer_sessions(id);
     `);
 
-    // 🛡 FIX #6: Índices críticos para rendimiento bajo tráfico alto
     db.exec(`
         CREATE INDEX IF NOT EXISTS idx_pedidos_email ON pedidos(email);
         CREATE INDEX IF NOT EXISTS idx_pedidos_status ON pedidos(status);
@@ -234,9 +264,6 @@ try {
     `);
     console.log('✅ Índices de pedidos verificados');
 
-    // ===============================
-    // PHASE 6: TABLA DE STOCK (inventario)
-    // ===============================
     db.exec(`
         CREATE TABLE IF NOT EXISTS inventory (
             product_id TEXT PRIMARY KEY,
@@ -248,7 +275,6 @@ try {
     `);
     console.log('✅ Tabla inventory verificada');
 
-    // Seed inventory desde PRODUCTS_DB si la tabla está vacía
     const inventoryCount = db.prepare(`SELECT COUNT(*) as c FROM inventory`).get().c;
     if (inventoryCount === 0 && PRODUCTS_DB.length > 0) {
         const insertStmt = db.prepare(`
@@ -256,7 +282,6 @@ try {
         `);
         const seedTransaction = db.transaction((products) => {
             for (const p of products) {
-                // Si el producto tiene campo stock, usarlo; si no, default 10
                 const stockValue = typeof p.stock === 'number' ? p.stock : 10;
                 insertStmt.run(String(p.id), stockValue);
             }
@@ -265,10 +290,7 @@ try {
         console.log(`📦 Inventario inicializado con ${PRODUCTS_DB.length} productos`);
     }
 
-    
-    // ===============================
-    // MIGRACIÓN SEGURA DE COLUMNAS (Railway-safe)
-    // ===============================
+    // MIGRACIÓN SEGURA DE COLUMNAS
     try {
         const columns = db
             .prepare(`PRAGMA table_info(pedidos)`)
@@ -279,27 +301,22 @@ try {
             db.exec(`ALTER TABLE pedidos ADD COLUMN tracking_number TEXT`);
             console.log('🧱 Columna tracking_number añadida');
         }
-
         if (!columns.includes('shipping_cost')) {
             db.exec(`ALTER TABLE pedidos ADD COLUMN shipping_cost REAL`);
             console.log('🧱 Columna shipping_cost añadida');
         }
-
         if (!columns.includes('shipping_status')) {
             db.exec(`ALTER TABLE pedidos ADD COLUMN shipping_status TEXT DEFAULT 'CONFIRMADO'`);
             console.log('🧱 Columna shipping_status añadida');
         }
-
         if (!columns.includes('shipping_history')) {
             db.exec(`ALTER TABLE pedidos ADD COLUMN shipping_history TEXT`);
             console.log('🧱 Columna shipping_history añadida');
         }
-
         if (!columns.includes('carrier_code')) {
             db.exec(`ALTER TABLE pedidos ADD COLUMN carrier_code TEXT`);
             console.log('🧱 Columna carrier_code añadida');
         }
-
     } catch (e) {
         console.error('⚠️ Error en migración segura:', e.message);
     }
@@ -321,27 +338,24 @@ try {
 // 2. CONFIGURACIÓN APP & RESEND
 // ===============================
 const app = express();
-/* ===============================
-   FIX CRÍTICO RAILWAY + RATE LIMIT
-   =============================== */
 app.set('trust proxy', 1);
 
 // ===============================
-// OBSERVABILIDAD: LOGGER ESTRUCTURADO (PHASE 6: + FILE PERSISTENCE)
+// COOKIE PARSER (PHASE 0: Required to read HttpOnly cookies)
 // ===============================
+// Must be added BEFORE routes that read cookies
+// No secret needed — we don't use signed cookies (JWT is self-validating)
+app.use(cookieParser());
 
-// --- Persistent file logger ---
+// ===============================
+// OBSERVABILIDAD: LOGGER ESTRUCTURADO
+// ===============================
 const LOG_DIR = isRailway ? path.join(RAILWAY_VOLUME, 'logs') : path.join(__dirname, 'logs');
 if (!fs.existsSync(LOG_DIR)) {
     fs.mkdirSync(LOG_DIR, { recursive: true });
 }
 const LOG_FILE = path.join(LOG_DIR, 'app.log');
 
-/**
- * Escribe log estructurado JSON al archivo + consola.
- * No bloquea — usa appendFileSync en producción (SQLite ya es sync).
- * En volumen alto se podría migrar a stream, pero para este volumen es correcto.
- */
 function writeLogToFile(level, message, context) {
     const entry = {
         timestamp: new Date().toISOString(),
@@ -351,9 +365,7 @@ function writeLogToFile(level, message, context) {
     };
     try {
         fs.appendFileSync(LOG_FILE, JSON.stringify(entry) + '\n');
-    } catch (e) {
-        // Silently fail — no queremos que un error de logging crashee el server
-    }
+    } catch (e) { /* silent */ }
 }
 
 const logger = {
@@ -371,7 +383,6 @@ const logger = {
     }
 };
 
-// --- Error counter for /metrics ---
 let errorCountLastHour = 0;
 let errorCountResetAt = Date.now() + 3600000;
 
@@ -386,16 +397,18 @@ function incrementErrorCount() {
 
 const PORT = process.env.PORT || 3000;
 const SERVER_START_TIME = Date.now();
-const BACKEND_VERSION = '2.1.0';
+const BACKEND_VERSION = '2.2.0';
 
-// Rate Limiter para Admin (Protección fuerza bruta)
+// Rate Limiter para Admin
 const adminLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 minutos
+    windowMs: 15 * 60 * 1000,
     max: 10,
     message: "Demasiados intentos de acceso al panel."
 });
 
-// Middleware de Autenticación JWT
+// ===============================
+// MIDDLEWARE: Admin JWT (Authorization header — unchanged)
+// ===============================
 function verifyToken(req, res, next) {
     const bearerHeader = req.headers['authorization'];
     if (typeof bearerHeader !== 'undefined') {
@@ -410,11 +423,37 @@ function verifyToken(req, res, next) {
         res.sendStatus(401);
     }
 }
-function verifyCustomerSession(req, res, next) {
-    const auth = req.headers.authorization;
-    if (!auth) return res.sendStatus(401);
 
-    const token = auth.split(' ')[1];
+// ===============================
+// MIDDLEWARE: Customer Session (PHASE 0: COOKIE-FIRST, Authorization header fallback)
+// ===============================
+/**
+ * PHASE 0 CHANGE:
+ * - PRIMARY: Read JWT from HttpOnly cookie (COOKIE_NAME)
+ * - FALLBACK: Read from Authorization header (backward compatibility during migration)
+ * 
+ * This allows:
+ * 1. New frontend (cookie-based) to work immediately
+ * 2. Old clients / API consumers that still send Authorization header to keep working
+ * 3. Gradual migration without breaking anything
+ * 
+ * After full migration, the Authorization header fallback can be removed.
+ */
+function verifyCustomerSession(req, res, next) {
+    // 1. Try cookie first (new secure flow)
+    let token = req.cookies[COOKIE_NAME];
+
+    // 2. Fallback to Authorization header (backward compatibility)
+    if (!token) {
+        const auth = req.headers.authorization;
+        if (auth && auth.startsWith('Bearer ')) {
+            token = auth.split(' ')[1];
+        }
+    }
+
+    if (!token) {
+        return res.sendStatus(401);
+    }
 
     try {
         const decoded = jwt.verify(token, JWT_SECRET);
@@ -424,6 +463,7 @@ function verifyCustomerSession(req, res, next) {
         }
 
         const session = db.prepare(`
+            WHERE id = ? AND email = ?
             SELECT * FROM customer_sessions WHERE id = ?
         `).get(decoded.session_id);
 
@@ -447,14 +487,15 @@ function verifyCustomerSession(req, res, next) {
         next();
 
     } catch (e) {
+        // If cookie auth failed, clear the invalid cookie
+        res.clearCookie(COOKIE_NAME, getClearCookieOptions());
         return res.sendStatus(403);
     }
 }
 
 
-
 // ===============================
-// OBSERVABILIDAD: REQUEST CORRELATION
+// REQUEST CORRELATION
 // ===============================
 app.use((req, res, next) => {
     req.requestId = `req_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
@@ -470,7 +511,6 @@ app.use((req, res, next) => {
             ip: req.ip,
             durationMs: duration
         });
-        // Track errors for /metrics
         if (res.statusCode >= 500) {
             incrementErrorCount();
         }
@@ -479,19 +519,53 @@ app.use((req, res, next) => {
     next();
 });
 
-// Configuración CORS
+// ===============================
+// CORS CONFIGURATION (PHASE 0: credentials: true)
+// ===============================
+/**
+ * PHASE 0 CRITICAL CHANGE:
+ * - credentials: true → Required for cross-origin cookie transmission
+ * - origin must be EXPLICIT (not '*') when credentials is true
+ * - This is a browser requirement per the Fetch specification
+ * 
+ * WHY SameSite=None works here:
+ * - Frontend: https://ethereal-frontend.netlify.app (Netlify)
+ * - Backend: https://ethere4l-backend-production.up.railway.app (Railway)
+ * - These are DIFFERENT origins → cross-origin → requires SameSite=None
+ * - SameSite=None requires Secure=true (HTTPS only)
+ * - Railway serves over HTTPS by default ✓
+ * 
+ * WHY this doesn't affect Stripe webhooks:
+ * - Stripe webhooks are server-to-server HTTP POST requests
+ * - They don't use cookies or CORS — they use signature verification
+ * - The webhook endpoint (/api/webhook) is hit directly by Stripe servers
+ */
+const ALLOWED_ORIGINS = [
+    'https://ethereal-frontend.netlify.app',
+    'http://localhost:5500',
+    'http://127.0.0.1:5500',
+    'http://localhost:3001',
+    process.env.FRONTEND_URL
+].filter(Boolean);
+
 app.use(cors({
-    origin: [
-        'https://ethereal-frontend.netlify.app',
-        'http://localhost:5500',
-        'http://127.0.0.1:5500',
-        process.env.FRONTEND_URL 
-    ].filter(Boolean),
+    origin: function(origin, callback) {
+        // Allow requests with no origin (Stripe webhooks, server-to-server, curl, etc.)
+        if (!origin) return callback(null, true);
+        
+        if (ALLOWED_ORIGINS.indexOf(origin) !== -1) {
+            return callback(null, true);
+        }
+        
+        logger.warn('CORS_BLOCKED', { origin });
+        return callback(new Error('CORS not allowed'), false);
+    },
     methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization']
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    credentials: true  // ← PHASE 0: Required for Set-Cookie / Cookie headers cross-origin
 }));
 
-// Configuración Email
+// Email config
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'ethere4lyfe@gmail.com'; 
 const SENDER_EMAIL = 'orders@ethere4l.com';
@@ -528,7 +602,7 @@ app.post('/api/webhook', express.raw({type: 'application/json'}), async (req, re
     res.json({received: true});
 });
 
-// AHORA SÍ: Parser JSON global para el resto de rutas
+// AHORA SÍ: Parser JSON global
 app.use(express.json());
 
 // ===============================
@@ -536,11 +610,11 @@ app.use(express.json());
 // ===============================
 
 app.get('/', (req, res) => {
-    res.json({ status: 'online', service: 'ETHERE4L Backend v2.1', mode: 'Stripe Enabled' });
+    res.json({ status: 'online', service: 'ETHERE4L Backend v2.2', mode: 'Stripe Enabled + HttpOnly Cookies' });
 });
 
 // ===============================
-// PHASE 6: HEALTH CHECK ROBUSTO
+// HEALTH CHECK
 // ===============================
 app.get('/health', (req, res) => {
     let dbStatus = 'error';
@@ -576,10 +650,9 @@ app.get('/health', (req, res) => {
 });
 
 // ===============================
-// PHASE 6: MONITORING ENDPOINT
+// METRICS
 // ===============================
 app.get('/metrics', (req, res) => {
-    // Reset error counter if window expired
     if (Date.now() > errorCountResetAt) {
         errorCountLastHour = 0;
         errorCountResetAt = Date.now() + 3600000;
@@ -591,15 +664,13 @@ app.get('/metrics', (req, res) => {
 
     try {
         if (dbPersistent) {
-            const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
-
+            const today = new Date().toISOString().split('T')[0];
             const hoyStats = db.prepare(`
                 SELECT COUNT(*) as count FROM pedidos 
                 WHERE date(created_at) = date(?)
             `).get(today);
             pedidosHoy = hoyStats ? hoyStats.count : 0;
 
-            // Sumar ventas pagadas de hoy
             const ventasHoy = db.prepare(`
                 SELECT data FROM pedidos 
                 WHERE date(created_at) = date(?) AND status = 'PAGADO'
@@ -609,7 +680,7 @@ app.get('/metrics', (req, res) => {
                 try {
                     const parsed = JSON.parse(row.data);
                     totalVentasHoy += parseSafeNumber(parsed.pedido?.total, 0);
-                } catch (e) { /* skip malformed */ }
+                } catch (e) { /* skip */ }
             }
 
             const totalStats = db.prepare(`SELECT COUNT(*) as count FROM pedidos`).get();
@@ -632,14 +703,13 @@ app.get('/metrics', (req, res) => {
 });
 
 
-// --- CREAR SESIÓN DE PAGO (HARDENED: SERVER-SIDE PRICE + QUANTITY + STOCK VALIDATION) ---
+// ===============================
+// CHECKOUT SESSION (unchanged — no auth cookies involved)
+// ===============================
 app.post('/api/create-checkout-session', async (req, res) => {
     try {
         const { items, customer } = req.body;
 
-        // ===============================
-        // PHASE 6: VALIDACIÓN DE EMAIL
-        // ===============================
         const customerEmail = customer?.email ? String(customer.email).trim().toLowerCase() : '';
         if (!validateEmail(customerEmail)) {
             return res.status(400).json({ 
@@ -647,7 +717,6 @@ app.post('/api/create-checkout-session', async (req, res) => {
             });
         }
 
-        // 🛡 FIX #2: Validación estricta de cantidad
         for (const item of items) {
             const cantidad = parseSafeNumber(item.cantidad, 0);
             if (!Number.isInteger(cantidad) || cantidad < 1 || cantidad > 10) {
@@ -657,9 +726,6 @@ app.post('/api/create-checkout-session', async (req, res) => {
             }
         }
 
-        // ===============================
-        // PHASE 6: VALIDACIÓN DE STOCK (PRE-CHECK)
-        // ===============================
         if (dbPersistent && PRODUCTS_DB.length > 0) {
             for (const item of items) {
                 const cantidadLimpia = parseSafeNumber(item.cantidad, 1);
@@ -680,59 +746,39 @@ app.post('/api/create-checkout-session', async (req, res) => {
                         });
                     }
                 }
-                // Si no hay registro en inventory, permitimos (backward compatible)
             }
         }
         
-        // 1. GENERAR ID DE ORDEN AQUÍ PARA USARLO EN DB Y METADATA
         const tempOrderId = `ord_${Date.now()}_${Math.random().toString(36).slice(2,6)}`;
-
-        // DEFINICIÓN SEGURA DEL DOMINIO
         const FRONTEND_URL = process.env.FRONTEND_URL || req.headers.origin || 'https://ethereal-frontend.netlify.app';
 
         let lineItems = [];
         let pesoTotal = 0;
-
-        // 🛡 FIX #1: Array para reconstruir subtotal/total 100% server-side
         let serverSubtotal = 0;
 
-        // 2. Reconstruir orden segura
         for (const item of items) {
-            // Buscamos el producto en la DB local del servidor
             const dbProduct = PRODUCTS_DB.length > 0 
                 ? PRODUCTS_DB.find(p => String(p.id) === String(item.id)) 
-                : null; // Si no hay DB, es null
+                : null;
 
-            // Fallback al item del frontend si no hay DB
             const productFinal = dbProduct || item;
-            
-            // 🛡 FIX #1: PRECIO SIEMPRE DESDE DB CUANDO EXISTE
-            // Si tenemos productos en DB, usamos ese precio (no el del frontend)
             const rawPrice = dbProduct ? dbProduct.precio : item.precio;
             const precioLimpio = parseSafeNumber(rawPrice, 0);
 
-            // Validar que el precio sea mayor a 0
             if (precioLimpio <= 0) {
                 logger.warn('PRECIO_INVALIDO', { itemId: item.id, rawPrice, precioLimpio });
                 return res.status(400).json({ error: `Precio inválido para producto ${item.id}` });
             }
 
             const cantidadLimpia = parseSafeNumber(item.cantidad, 1);
-            
-            // Aseguramos que el peso sea un número
             const pesoLimpio = parseSafeNumber(productFinal.peso, 0.6);
             pesoTotal += pesoLimpio * cantidadLimpia;
-
-            // 🛡 FIX #1: Acumular subtotal server-side
             serverSubtotal += precioLimpio * cantidadLimpia;
 
-            // --- Sanitización de imágenes ---
             let productImages = [];
             if (dbProduct && dbProduct.fotos && dbProduct.fotos.length > 0) {
-                 // Prioridad: Fotos del servidor
-                 productImages = [dbProduct.fotos[0]];
+                productImages = [dbProduct.fotos[0]];
             } else if (item.imagen && item.imagen.startsWith('http')) { 
-                // Fallback: Foto del frontend
                 productImages = [item.imagen];
             }
 
@@ -741,48 +787,33 @@ app.post('/api/create-checkout-session', async (req, res) => {
                     currency: 'mxn',
                     product_data: {
                         name: productFinal.nombre,
-                        images: productImages, // Array limpio
+                        images: productImages,
                         metadata: {
                             talla: item.talla,
                             id_producto: item.id
                         }
                     },
-                    // Usamos el precio limpio multiplicado por 100
                     unit_amount: Math.round(precioLimpio * 100), 
                 },
                 quantity: cantidadLimpia,
             });
-        } // Fin del for
+        }
 
-        // 3. LOGICA DE ENVÍO COMERCIAL (Items + Peso)
         const totalItems = items.reduce((acc, item) => acc + parseSafeNumber(item.cantidad, 1), 0);
         let costoEnvio = 0;
 
-        if (totalItems === 1) {
-            costoEnvio = 900; 
-        } else if (totalItems === 2) {
-            costoEnvio = 1000; 
-        } else if (totalItems === 3) {
-            costoEnvio = 1300; 
-        } else {
-            costoEnvio = 1500; 
-        }
+        if (totalItems === 1) costoEnvio = 900; 
+        else if (totalItems === 2) costoEnvio = 1000; 
+        else if (totalItems === 3) costoEnvio = 1300; 
+        else costoEnvio = 1500; 
 
-        // Safety Check: Si el peso es extraordinario (>10kg) cobrar extra
-        if (pesoTotal > 10.0) {
-            costoEnvio += 500; 
-        }
+        if (pesoTotal > 10.0) costoEnvio += 500; 
 
-        // ===============================
-        // 🛡 FIX #1: SNAPSHOT REAL DEL PEDIDO (100% SERVER-SIDE PRICES)
-        // ===============================
         const pedidoSnapshot = {
             items: items.map(item => {
                 const dbProduct = PRODUCTS_DB.find(p => String(p.id) === String(item.id)) || item;
-                // 🛡 Precio SIEMPRE desde DB cuando existe, NUNCA del frontend
                 const precio = parseSafeNumber(dbProduct.precio || item.precio, 0);
                 const cantidad = parseSafeNumber(item.cantidad, 1);
-
                 return {
                     id: item.id,
                     nombre: dbProduct.nombre || item.nombre,
@@ -793,18 +824,13 @@ app.post('/api/create-checkout-session', async (req, res) => {
                     subtotal: precio * cantidad
                 };
             }),
-            // 🛡 FIX #1: Subtotal y total calculados 100% server-side
             subtotal: serverSubtotal,
             envio: costoEnvio,
             total: serverSubtotal + costoEnvio
         };
 
-        // ============================================
-        // PHASE 6: TRANSACCIÓN ATÓMICA (STOCK + PEDIDO)
-        // ============================================
         if (dbPersistent) {
             const createOrderTransaction = db.transaction(() => {
-                // 1. Validar stock DENTRO de transacción (previene race condition)
                 for (const item of items) {
                     const cantidadLimpia = parseSafeNumber(item.cantidad, 1);
                     const inv = db.prepare(`
@@ -819,7 +845,6 @@ app.post('/api/create-checkout-session', async (req, res) => {
                     }
                 }
 
-                // 2. Reservar stock (incrementar reserved)
                 for (const item of items) {
                     const cantidadLimpia = parseSafeNumber(item.cantidad, 1);
                     db.prepare(`
@@ -829,7 +854,6 @@ app.post('/api/create-checkout-session', async (req, res) => {
                     `).run(cantidadLimpia, String(item.id));
                 }
 
-                // 3. Insertar pedido
                 db.prepare(`
                     INSERT INTO pedidos (id, email, data, status, shipping_cost)
                     VALUES (?, ?, ?, 'PENDIENTE', ?)
@@ -859,16 +883,12 @@ app.post('/api/create-checkout-session', async (req, res) => {
             }
         }
 
-        // 5. Crear Sesión Stripe
         const session = await stripe.checkout.sessions.create({
             payment_method_types: ['card'],
             line_items: lineItems,
             mode: 'payment',
             customer_email: customerEmail,
-            // ⚠️ FIX: Solo pasamos order_id. La data ya está en DB.
-            metadata: {
-                order_id: tempOrderId 
-            },
+            metadata: { order_id: tempOrderId },
             shipping_options: [
                 {
                     shipping_rate_data: {
@@ -895,14 +915,14 @@ app.post('/api/create-checkout-session', async (req, res) => {
     }
 });
 
-// (LEGACY) Endpoint manual anterior
+// (LEGACY)
 app.post('/api/crear-pedido', (req, res) => {
     res.json({ success: true, message: "Use /api/create-checkout-session for payments" });
 });
 
 
 // ===============================
-// 4.1 API TRACKING (SESSION-LOCKED)
+// TRACKING (per-order token via Authorization header — unchanged)
 // ===============================
 const trackingLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
@@ -913,6 +933,8 @@ const trackingLimiter = rateLimit({
 app.get('/api/orders/track/:orderId', trackingLimiter, (req, res) => {
     const { orderId } = req.params;
 
+    // This endpoint uses per-order tokens (Authorization header)
+    // NOT session cookies — because order detail links are shared via email
     const authHeader = req.headers.authorization;
     if (!authHeader) {
         return res.status(401).json({ error: 'Authorization requerido' });
@@ -974,18 +996,13 @@ app.get('/api/orders/track/:orderId', trackingLimiter, (req, res) => {
 });
 
 
-
-
 // ===============================
 // 5. API ENDPOINTS (ADMIN)
 // ===============================
 
-// Login Admin (JWT)
 app.post('/api/admin/login', adminLimiter, async (req, res) => {
     try {
         const { password } = req.body;
-
-        // LOG CLAVE: confirma que el request YA NO MUERE en rate-limit
         console.log(`🔐 Admin login attempt | IP: ${req.ip}`);
 
         if (!process.env.ADMIN_PASS_HASH || !process.env.JWT_SECRET) {
@@ -993,10 +1010,8 @@ app.post('/api/admin/login', adminLimiter, async (req, res) => {
             return res.status(500).json({ error: 'Server misconfigured' });
         }
 
-        // LIMPIEZA CRÍTICA (evita espacios invisibles)
         const cleanPassword = String(password || '').trim();
         const cleanHash = String(process.env.ADMIN_PASS_HASH).trim();
-
         const match = await bcrypt.compare(cleanPassword, cleanHash);
 
         if (!match) {
@@ -1022,7 +1037,9 @@ app.post('/api/admin/login', adminLimiter, async (req, res) => {
 });
 
 
-
+// ===============================
+// MAGIC LINK (unchanged — sends email with link to mis-pedidos.html?token=...)
+// ===============================
 app.post('/api/magic-link', magicLinkLimiter, async (req, res) => {
     try {
         const { email } = req.body;
@@ -1058,7 +1075,6 @@ app.post('/api/magic-link', magicLinkLimiter, async (req, res) => {
             logger.info('MAGIC_LINK_SENT', { email: cleanEmail });
         }
 
-        // 🔐 Respuesta SIEMPRE positiva (anti-enumeración)
         res.json({ success: true });
 
     } catch (err) {
@@ -1068,6 +1084,19 @@ app.post('/api/magic-link', magicLinkLimiter, async (req, res) => {
 });
 
 
+// ===============================
+// SESSION START (PHASE 0: NOW SETS HTTPONLY COOKIE)
+// ===============================
+/**
+ * PHASE 0 CRITICAL CHANGE:
+ * 
+ * BEFORE: Returns { token: "jwt..." } → frontend stores in localStorage
+ * AFTER:  Sets HttpOnly cookie + returns { success: true, email: "..." }
+ * 
+ * The JWT is NEVER exposed to JavaScript.
+ * The browser stores it as an HttpOnly cookie automatically.
+ * All subsequent requests include it via credentials: 'include'.
+ */
 app.get('/api/session/start', (req, res) => {
     const { token } = req.query;
     if (!token) return res.sendStatus(400);
@@ -1079,69 +1108,70 @@ app.get('/api/session/start', (req, res) => {
             return res.sendStatus(403);
         }
 
+        // Create persistent session in DB
         const customerToken = createCustomerSession(decoded.email, req);
 
-        res.json({ token: customerToken });
+        // SET HTTPONLY COOKIE instead of returning token in body
+        res.cookie(COOKIE_NAME, customerToken, getSessionCookieOptions(CUSTOMER_SESSION_DAYS));
 
-    } catch {
-        res.sendStatus(403);
-    }
-});
+        logger.info('SESSION_STARTED_COOKIE', { email: decoded.email });
 
-
-
-// 🛡 FIX #4: /api/my-orders — parsed variable was undefined (CRASH BUG)
-app.get('/api/my-orders', (req, res) => {
-    const auth = req.headers.authorization;
-    if (!auth) return res.sendStatus(401);
-
-    const token = auth.split(' ')[1];
-
-    try {
-        const decoded = jwt.verify(token, process.env.JWT_SECRET);
-
-        if (decoded.scope !== 'read_orders') {
-            return res.sendStatus(403);
-        }
-
-        const orders = db.prepare(`
-            SELECT id, status, created_at, data, tracking_number
-            FROM pedidos
-            WHERE email = ?
-            ORDER BY created_at DESC
-        `).all(decoded.email);
-
-        const response = orders.map(row => {
-            // 🛡 FIX #4: ESTA LÍNEA FALTABA — parsed nunca se definía → crash
-            let parsed;
-            try {
-                parsed = JSON.parse(row.data);
-            } catch {
-                parsed = { pedido: { total: 0, items: [] } };
-            }
-
-            const orderToken = generateOrderToken(row.id, decoded.email);
-
-            return {
-                id: row.id,
-                status: row.status,
-                date: row.created_at,
-                total: parsed.pedido.total,
-                item_count: parsed.pedido.items.length,
-                tracking_number: row.tracking_number,
-                access_token: orderToken
-            };
+        // Return success + email for display (NOT the token)
+        res.json({ 
+            success: true, 
+            email: decoded.email 
         });
 
-        res.json({ orders: response });
-
-    } catch (err) {
-        console.error('My orders error:', err);
+    } catch (e) {
+        logger.warn('SESSION_START_FAILED', { error: e.message });
         res.sendStatus(403);
     }
-
 });
 
+
+// ===============================
+// SESSION LOGOUT (PHASE 0: NEW ENDPOINT)
+// ===============================
+/**
+ * Clears the HttpOnly session cookie and revokes the session in DB.
+ * 
+ * This is called by:
+ * 1. The logout button on mis-pedidos.html
+ * 2. The login.html page on load (to clear stale sessions)
+ */
+app.post('/api/session/logout', (req, res) => {
+    const token = req.cookies[COOKIE_NAME];
+
+    if (token) {
+        // Revoke session in DB
+        try {
+            const decoded = jwt.verify(token, JWT_SECRET);
+            if (decoded.session_id) {
+                db.prepare(`DELETE FROM customer_sessions WHERE id = ?`)
+                  .run(decoded.session_id);
+                logger.info('SESSION_REVOKED', { sessionId: decoded.session_id });
+            }
+        } catch (e) {
+            // Token might be expired/invalid — that's fine, still clear the cookie
+        }
+    }
+
+    // Clear the cookie regardless
+    res.clearCookie(COOKIE_NAME, getClearCookieOptions());
+
+    res.json({ success: true });
+});
+
+
+// ===============================
+// CUSTOMER ORDERS (PHASE 0: COOKIE AUTH + returns email)
+// ===============================
+/**
+ * PHASE 0 CHANGE:
+ * - Now uses verifyCustomerSession which reads from cookie first
+ * - Returns { email, orders } so frontend can display user email
+ *   without needing to decode JWT (which it can't access anymore)
+ */
 app.get('/api/customer/orders', verifyCustomerSession, (req, res) => {
     try {
         const email = req.customer.email.toLowerCase();
@@ -1170,23 +1200,77 @@ app.get('/api/customer/orders', verifyCustomerSession, (req, res) => {
                 total: pedido.total || 0,
                 shipping: pedido.envio || 0,
                 items: pedido.items || [],
-                order_token: generateOrderToken(o.id, email) // 🔥 CLAVE
+                order_token: generateOrderToken(o.id, email)
             };
-
         });
 
-        res.json(orders);
+        // PHASE 0: Return email alongside orders for frontend display
+        res.json({
+            email: email,
+            orders: orders
+        });
 
     } catch (err) {
         console.error('CUSTOMER_ORDERS_ERROR', err);
-        res.status(500).json([]);
+        res.status(500).json({ email: '', orders: [] });
     }
 });
 
 
+// ===============================
+// MY-ORDERS (legacy — still uses Authorization header for backward compat)
+// ===============================
+app.get('/api/my-orders', (req, res) => {
+    const auth = req.headers.authorization;
+    if (!auth) return res.sendStatus(401);
+
+    const token = auth.split(' ')[1];
+
+    try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+        if (decoded.scope !== 'read_orders') {
+            return res.sendStatus(403);
+        }
+
+        const orders = db.prepare(`
+            SELECT id, status, created_at, data, tracking_number
+            FROM pedidos
+            WHERE email = ?
+            ORDER BY created_at DESC
+        `).all(decoded.email);
+
+        const response = orders.map(row => {
+            let parsed;
+            try {
+                parsed = JSON.parse(row.data);
+            } catch {
+                parsed = { pedido: { total: 0, items: [] } };
+            }
+
+            const orderToken = generateOrderToken(row.id, decoded.email);
+
+            return {
+                id: row.id,
+                status: row.status,
+                date: row.created_at,
+                total: parsed.pedido.total,
+                item_count: parsed.pedido.items.length,
+                tracking_number: row.tracking_number,
+                access_token: orderToken
+            };
+        });
+
+        res.json({ orders: response });
+
+    } catch (err) {
+        console.error('My orders error:', err);
+        res.sendStatus(403);
+    }
+});
 
 
-// Obtener Órdenes (Protegido)
+// Admin orders
 app.get('/api/admin/orders', verifyToken, (req, res) => {
     if (!dbPersistent) return res.json([]);
     try {
@@ -1201,16 +1285,11 @@ app.get('/api/admin/orders', verifyToken, (req, res) => {
     }
 });
 
-// Actualizar Tracking (Protegido + Trigger Email)
+// Update shipping
 app.post('/api/admin/update-shipping', verifyToken, async (req, res) => {
-    const { orderId, status, trackingNumber, carrier, description } = req.body; // Added description
+    const { orderId, status, trackingNumber, carrier, description } = req.body;
 
-    const VALID_STATUSES = [
-        'CONFIRMADO',
-        'EMPAQUETADO',
-        'EN_TRANSITO',
-        'ENTREGADO'
-    ];
+    const VALID_STATUSES = ['CONFIRMADO', 'EMPAQUETADO', 'EN_TRANSITO', 'ENTREGADO'];
 
     if (!VALID_STATUSES.includes(status)) {
         return res.status(400).json({ error: 'Estado inválido' });
@@ -1221,7 +1300,7 @@ app.post('/api/admin/update-shipping', verifyToken, async (req, res) => {
 
     let history = [];
     try {
-         history = order.shipping_history ? JSON.parse(order.shipping_history) : [];
+        history = order.shipping_history ? JSON.parse(order.shipping_history) : [];
     } catch(e) { history = []; }
 
     history.unshift({
@@ -1230,7 +1309,6 @@ app.post('/api/admin/update-shipping', verifyToken, async (req, res) => {
         timestamp: new Date().toISOString(),
         location: ''
     });
-
 
     db.prepare(`
         UPDATE pedidos
@@ -1248,7 +1326,6 @@ app.post('/api/admin/update-shipping', verifyToken, async (req, res) => {
         orderId
     );
 
-    // 📧 EMAIL AUTOMÁTICO
     if (resend) {
         await resend.emails.send({
             from: `ETHERE4L <${SENDER_EMAIL}>`,
@@ -1277,14 +1354,11 @@ function getStatusDescription(status) {
 }
 
 
-
 // ===============================
 // 6. FUNCIONES INTERNAS (WEBHOOK LOGIC)
 // ===============================
 
-// Manejo post-pago de Stripe
 async function handleStripeSuccess(session) {
-    // 1. OBTENER ID REAL DEL METADATA
     const orderId = session.metadata?.order_id;
     if (!orderId) {
         logger.error('WEBHOOK_NO_ORDER_ID', { sessionId: session.id });
@@ -1293,7 +1367,6 @@ async function handleStripeSuccess(session) {
 
     if (!dbPersistent) return;
 
-    // 2. 🛡 FIX #3: IDEMPOTENCIA — Verificar si ya fue procesado
     try {
         const existingOrder = db.prepare(`SELECT status, data FROM pedidos WHERE id = ?`).get(orderId);
 
@@ -1302,7 +1375,6 @@ async function handleStripeSuccess(session) {
             return;
         }
 
-        // Si ya está PAGADO, no reprocesar (Stripe puede reenviar webhooks)
         if (existingOrder.status === 'PAGADO') {
             logger.warn('WEBHOOK_IDEMPOTENCY', { 
                 orderId, 
@@ -1311,9 +1383,7 @@ async function handleStripeSuccess(session) {
             return;
         }
 
-        // 3. TRANSACCIÓN: CONFIRMAR PAGO + DESCONTAR STOCK REAL
         const confirmPaymentTransaction = db.transaction(() => {
-            // Actualizar estado a PAGADO
             db.prepare(`
                 UPDATE pedidos
                 SET 
@@ -1321,12 +1391,8 @@ async function handleStripeSuccess(session) {
                     payment_ref = ?,
                     paid_at = datetime('now')
                 WHERE id = ?
-            `).run(
-                session.payment_intent,
-                orderId
-            );
+            `).run(session.payment_intent, orderId);
 
-            // Confirmar stock: mover de reserved a sold (decrementar stock y reserved)
             let parsed;
             try {
                 parsed = JSON.parse(existingOrder.data);
@@ -1347,7 +1413,6 @@ async function handleStripeSuccess(session) {
 
         confirmPaymentTransaction();
 
-        // 4. RECUPERAR DATOS COMPLETOS DE LA DB (Hydration Source)
         const row = db.prepare(`SELECT data FROM pedidos WHERE id=?`).get(orderId);
         if (!row) {
             logger.error('WEBHOOK_DATA_MISSING', { orderId });
@@ -1362,7 +1427,6 @@ async function handleStripeSuccess(session) {
 
         logger.info('PAGO_CONFIRMADO', { orderId, total: pedido.total });
 
-        // 5. GENERAR PDF Y CORREOS (BACKGROUND)
         setImmediate(() => {
             processOrderBackground(orderId, cliente, pedido)
                 .catch(e => {
@@ -1377,16 +1441,13 @@ async function handleStripeSuccess(session) {
     }
 }
 
-// Reutilizamos tu Worker existente
 async function processOrderBackground(jobId, cliente, pedido) {
     try {
         const pdfBuffer = await buildPDF(cliente, pedido, jobId, 'CLIENTE');
 
         const accessToken = generateOrderToken(jobId, cliente.email);
         const FRONTEND_URL = process.env.FRONTEND_URL || 'https://ethereal-frontend.netlify.app';
-        const trackingUrl =
-         `${FRONTEND_URL}/pedido-ver.html?id=${jobId}&token=${accessToken}`;
-
+        const trackingUrl = `${FRONTEND_URL}/pedido-ver.html?id=${jobId}&token=${accessToken}`;
 
         if (resend) {
             await resend.emails.send({
@@ -1419,7 +1480,7 @@ async function processOrderBackground(jobId, cliente, pedido) {
 
 
 // ===============================
-// PHASE 6: CLEANUP — Liberar stock reservado de pedidos PENDIENTES antiguos (>2h)
+// CLEANUP: Liberar stock de pedidos PENDIENTES antiguos
 // ===============================
 function cleanupStaleReservations() {
     if (!dbPersistent) return;
@@ -1449,7 +1510,6 @@ function cleanupStaleReservations() {
                     `).run(qty, String(item.id));
                 }
 
-                // Marcar como EXPIRADO
                 db.prepare(`UPDATE pedidos SET status = 'EXPIRADO' WHERE id = ?`).run(order.id);
             }
         });
@@ -1464,9 +1524,7 @@ function cleanupStaleReservations() {
     }
 }
 
-// Ejecutar cada 30 minutos
 setInterval(cleanupStaleReservations, 30 * 60 * 1000);
-// También ejecutar al inicio (después de 10 segundos para que DB esté lista)
 setTimeout(cleanupStaleReservations, 10000);
 
 
@@ -1475,7 +1533,9 @@ setTimeout(cleanupStaleReservations, 10000);
 // ===============================
 const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 ETHERE4L Backend V${BACKEND_VERSION} corriendo en puerto ${PORT}`);
-    logger.info('SERVER_STARTED', { port: PORT, version: BACKEND_VERSION, railway: isRailway });
+    console.log(`🔒 Auth: HttpOnly Cookie (Phase 0 Security)`);
+    console.log(`🍪 Cookie: ${COOKIE_NAME} | SameSite=${IS_PRODUCTION ? 'None' : 'Lax'} | Secure=${IS_PRODUCTION}`);
+    logger.info('SERVER_STARTED', { port: PORT, version: BACKEND_VERSION, railway: isRailway, authMode: 'httponly_cookie' });
 });
 
 process.on('SIGTERM', () => {
