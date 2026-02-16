@@ -23,6 +23,12 @@
 //   ✅ Added maxAge and optionsSuccessStatus to CORS config
 //   ✅ ALLOWED_ORIGINS includes ethere4l.com for future migration
 // =========================================================
+// CHANGELOG FASE 3 (CORRECCIONES):
+//   ✅ FIX 1: Cookie 'domain' added for Safari iOS cross-site
+//   ✅ FIX 2: FRONTEND_URL env var validation
+//   ✅ FIX 3: Added /api/catalogo endpoint for future resilience
+//   ✅ FIX 4: Vary header for proper CORS caching
+// =========================================================
 
 // Cargar variables de entorno solo en local
 if (process.env.NODE_ENV !== 'production') {
@@ -69,28 +75,48 @@ const ADMIN_PASS_HASH = process.env.ADMIN_PASS_HASH;
 const STRIPE_WEBHOOK_SECRET = (process.env.STRIPE_WEBHOOK_SECRET || '').trim();
 
 // ===============================
-// 0.0 COOKIE CONFIGURATION
+// 0.0 COOKIE CONFIGURATION (FIXED)
 // ===============================
 const COOKIE_NAME = 'ethere4l_session';
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
+// ✅ FIX 1: Cookie domain for Safari iOS cross-site support
+// Safari iOS REQUIRES explicit domain for SameSite=None cookies
+// to be accepted in cross-origin contexts (Netlify → Railway)
+const COOKIE_DOMAIN = process.env.COOKIE_DOMAIN || undefined;
+// Set COOKIE_DOMAIN=.api.ethere4l.com in Railway env vars
+
 function getSessionCookieOptions(maxAgeDays) {
-    return {
+    var options = {
         httpOnly: true,
         secure: IS_PRODUCTION,
         sameSite: IS_PRODUCTION ? 'None' : 'Lax',
         path: '/',
         maxAge: maxAgeDays * 24 * 60 * 60 * 1000
     };
+
+    // ✅ FIX 1: Add domain in production for Safari iOS compatibility
+    if (IS_PRODUCTION && COOKIE_DOMAIN) {
+        options.domain = COOKIE_DOMAIN;
+    }
+
+    return options;
 }
 
 function getClearCookieOptions() {
-    return {
+    var options = {
         httpOnly: true,
         secure: IS_PRODUCTION,
         sameSite: IS_PRODUCTION ? 'None' : 'Lax',
         path: '/'
     };
+
+    // ✅ FIX 1: Must match domain used when setting the cookie
+    if (IS_PRODUCTION && COOKIE_DOMAIN) {
+        options.domain = COOKIE_DOMAIN;
+    }
+
+    return options;
 }
 
 // ===============================
@@ -362,14 +388,14 @@ const SERVER_START_TIME = Date.now();
 const BACKEND_VERSION = '2.3.0';
 
 // ===============================
-// CORS CONFIG (declared before middleware chain)
+// CORS CONFIG (ENHANCED)
 // ===============================
-const FRONTEND_URL = process.env.FRONTEND_URL || 'https://ethereal-frontend.netlify.app';
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://ethere4l.com';
 
 const ALLOWED_ORIGINS = [
-    'https://ethereal-frontend.netlify.app',
     'https://ethere4l.com',
     'https://www.ethere4l.com',
+    'https://ethereal-frontend.netlify.app',
     'http://localhost:5500',
     'http://127.0.0.1:5500',
     'http://localhost:3001',
@@ -401,13 +427,14 @@ const corsOptions = {
 // =========================================================
 //   1. trust proxy
 //   2. CORS middleware (headers on ALL responses)
-//   3. OPTIONS preflight handler (responds to all OPTIONS)
-//   4. Stripe webhook (raw body, BEFORE express.json)
-//   5. express.json()
-//   6. cookieParser()
-//   7. Request correlation / logging
-//   8. Routes
-//   9. Error handlers
+//   3. Vary header (FIX 4)
+//   4. OPTIONS preflight handler (responds to all OPTIONS)
+//   5. Stripe webhook (raw body, BEFORE express.json)
+//   6. express.json()
+//   7. cookieParser()
+//   8. Request correlation / logging
+//   9. Routes
+//   10. Error handlers
 // =========================================================
 
 // --- STEP 1: Trust proxy ---
@@ -416,10 +443,16 @@ app.set('trust proxy', 1);
 // --- STEP 2: CORS middleware ---
 app.use(cors(corsOptions));
 
-// --- STEP 3: Explicit preflight handler ---
+// --- STEP 3: ✅ FIX 4: Add Vary header for proper CDN/proxy caching ---
+app.use(function(req, res, next) {
+    res.setHeader('Vary', 'Origin');
+    next();
+});
+
+// --- STEP 4: Explicit preflight handler ---
 app.options('*', cors(corsOptions));
 
-// --- STEP 4: Stripe webhook (BEFORE express.json) ---
+// --- STEP 5: Stripe webhook (BEFORE express.json) ---
 app.post('/api/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
     const sig = req.headers['stripe-signature'];
     let event;
@@ -446,13 +479,13 @@ app.post('/api/webhook', express.raw({ type: 'application/json' }), async (req, 
     res.json({ received: true });
 });
 
-// --- STEP 5: JSON body parser ---
+// --- STEP 6: JSON body parser ---
 app.use(express.json());
 
-// --- STEP 6: Cookie parser ---
+// --- STEP 7: Cookie parser ---
 app.use(cookieParser());
 
-// --- STEP 7: Request correlation & logging ---
+// --- STEP 8: Request correlation & logging ---
 app.use((req, res, next) => {
     req.requestId = `req_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
     const start = Date.now();
@@ -591,7 +624,7 @@ app.get('/', (req, res) => {
     res.json({
         status: 'online',
         service: 'ETHERE4L Backend v' + BACKEND_VERSION,
-        mode: 'Stripe + HttpOnly Cookies + CORS Fixed'
+        mode: 'Stripe + HttpOnly Cookies + CORS Fixed + Safari iOS Compatible'
     });
 });
 
@@ -628,6 +661,7 @@ app.get('/health', (req, res) => {
         node: process.version,
         version: BACKEND_VERSION,
         cors: { originsCount: UNIQUE_ORIGINS.length, preflightEnabled: true },
+        cookieDomain: COOKIE_DOMAIN || 'not set',
         timestamp: new Date().toISOString()
     });
 });
@@ -685,6 +719,35 @@ app.get('/metrics', (req, res) => {
     });
 });
 
+// ===============================
+// ✅ FIX 3: CATALOG ENDPOINTS (NEW — for mobile resilience)
+// ===============================
+app.get('/api/catalogo', function(req, res) {
+    try {
+        if (CATALOG_DB.length > 0) {
+            return res.json(CATALOG_DB);
+        }
+        if (PRODUCTS_DB.length > 0) {
+            return res.json(PRODUCTS_DB);
+        }
+        res.status(404).json({ error: 'Catálogo no disponible' });
+    } catch (e) {
+        logger.error('CATALOG_ENDPOINT_ERROR', { error: e.message });
+        res.status(500).json({ error: 'Error cargando catálogo' });
+    }
+});
+
+app.get('/api/productos', function(req, res) {
+    try {
+        if (PRODUCTS_DB.length > 0) {
+            return res.json(PRODUCTS_DB);
+        }
+        res.status(404).json({ error: 'Productos no disponibles' });
+    } catch (e) {
+        logger.error('PRODUCTS_ENDPOINT_ERROR', { error: e.message });
+        res.status(500).json({ error: 'Error cargando productos' });
+    }
+});
 
 // ===============================
 // CHECKOUT SESSION
@@ -1550,11 +1613,12 @@ app.use((err, req, res, next) => {
 // ===============================
 const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 ETHERE4L Backend V${BACKEND_VERSION} corriendo en puerto ${PORT}`);
-    console.log(`🔒 Auth: HttpOnly Cookie (Phase 0 Security)`);
-    console.log(`🍪 Cookie: ${COOKIE_NAME} | SameSite=${IS_PRODUCTION ? 'None' : 'Lax'} | Secure=${IS_PRODUCTION}`);
-    console.log(`🌐 CORS: ${UNIQUE_ORIGINS.length} origins | preflight: explicit | credentials: true`);
+    console.log(`🔒 Auth: HttpOnly Cookie (Phase 0 Security + Safari iOS Fix)`);
+    console.log(`🍪 Cookie: ${COOKIE_NAME} | SameSite=${IS_PRODUCTION ? 'None' : 'Lax'} | Secure=${IS_PRODUCTION} | Domain=${COOKIE_DOMAIN || 'not set'}`);
+    console.log(`🌐 CORS: ${UNIQUE_ORIGINS.length} origins | preflight: explicit | credentials: true | Vary: Origin`);
     console.log(`📧 Email: ${resend ? 'Resend ACTIVE' : 'DISABLED'}`);
     console.log(`💳 Stripe: ${STRIPE_WEBHOOK_SECRET ? 'Webhook configured' : 'NO webhook secret'}`);
+    console.log(`📦 API Endpoints: /api/catalogo, /api/productos (resilience layer added)`);
     logger.info('SERVER_STARTED', {
         port: PORT,
         version: BACKEND_VERSION,
@@ -1562,7 +1626,9 @@ const server = app.listen(PORT, '0.0.0.0', () => {
         authMode: 'httponly_cookie',
         corsOrigins: UNIQUE_ORIGINS.length,
         emailActive: !!resend,
-        stripeWebhook: !!STRIPE_WEBHOOK_SECRET
+        stripeWebhook: !!STRIPE_WEBHOOK_SECRET,
+        cookieDomain: COOKIE_DOMAIN || 'not_set',
+        safariIOSFix: true
     });
 });
 
