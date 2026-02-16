@@ -14,6 +14,12 @@
 //   ✅ Admin endpoints unaffected (still use Authorization header)
 //   ✅ Per-order tokens (order_token) still via Authorization header (not stored client-side)
 // =========================================================
+// CHANGELOG FIX (EMAIL OBSERVABILITY):
+//   ✅ Added Resend response logging in processOrderBackground
+//   ✅ Added specific error handling for email failures
+//   ✅ Added Resend response logging in magic link endpoint
+//   ✅ Improved debugging capabilities without breaking functionality
+// =========================================================
 
 // Cargar variables de entorno solo en local
 if (process.env.NODE_ENV !== 'production') {
@@ -397,7 +403,7 @@ function incrementErrorCount() {
 
 const PORT = process.env.PORT || 3000;
 const SERVER_START_TIME = Date.now();
-const BACKEND_VERSION = '2.2.0';
+const BACKEND_VERSION = '2.2.1';
 
 // Rate Limiter para Admin
 const adminLimiter = rateLimit({
@@ -463,7 +469,6 @@ function verifyCustomerSession(req, res, next) {
         }
 
         const session = db.prepare(`
-            WHERE id = ? AND email = ?
             SELECT * FROM customer_sessions WHERE id = ?
         `).get(decoded.session_id);
 
@@ -610,7 +615,7 @@ app.use(express.json());
 // ===============================
 
 app.get('/', (req, res) => {
-    res.json({ status: 'online', service: 'ETHERE4L Backend v2.2', mode: 'Stripe Enabled + HttpOnly Cookies' });
+    res.json({ status: 'online', service: 'ETHERE4L Backend v2.2.1', mode: 'Stripe Enabled + HttpOnly Cookies + Email Observability' });
 });
 
 // ===============================
@@ -1038,7 +1043,7 @@ app.post('/api/admin/login', adminLimiter, async (req, res) => {
 
 
 // ===============================
-// MAGIC LINK (unchanged — sends email with link to mis-pedidos.html?token=...)
+// MAGIC LINK (with Resend response logging)
 // ===============================
 app.post('/api/magic-link', magicLinkLimiter, async (req, res) => {
     try {
@@ -1065,20 +1070,37 @@ app.post('/api/magic-link', magicLinkLimiter, async (req, res) => {
 
             const link = `${FRONTEND_URL}/mis-pedidos.html?token=${magicToken}`;
 
-            await resend.emails.send({
-                from: `ETHERE4L <${SENDER_EMAIL}>`,
-                to: [cleanEmail],
-                subject: "Accede a tus pedidos – ETHERE4L",
-                html: getMagicLinkEmail(link)
-            });
+            try {
+                const magicRes = await resend.emails.send({
+                    from: `ETHERE4L <${SENDER_EMAIL}>`,
+                    to: [cleanEmail],
+                    subject: "Accede a tus pedidos – ETHERE4L",
+                    html: getMagicLinkEmail(link)
+                });
 
-            logger.info('MAGIC_LINK_SENT', { email: cleanEmail });
+                logger.info('MAGIC_LINK_SENT', { 
+                    email: cleanEmail,
+                    resendId: magicRes.id,
+                    resendFrom: magicRes.from,
+                    resendTo: magicRes.to
+                });
+            } catch (emailErr) {
+                logger.error('MAGIC_LINK_EMAIL_FAILED', { 
+                    email: cleanEmail, 
+                    error: emailErr.message,
+                    statusCode: emailErr.statusCode || 'N/A',
+                    name: emailErr.name
+                });
+                // Still return success (anti-enumeration)
+            }
+        } else if (hasOrders && !resend) {
+            logger.warn('MAGIC_LINK_RESEND_NOT_CONFIGURED', { email: cleanEmail });
         }
 
         res.json({ success: true });
 
     } catch (err) {
-        logger.error('MAGIC_LINK_ERROR', { error: err.message });
+        logger.error('MAGIC_LINK_ERROR', { error: err.message, stack: err.stack });
         res.json({ success: true });
     }
 });
@@ -1450,26 +1472,50 @@ async function processOrderBackground(jobId, cliente, pedido) {
         const trackingUrl = `${FRONTEND_URL}/pedido-ver.html?id=${jobId}&token=${accessToken}`;
 
         if (resend) {
-            await resend.emails.send({
-                from: `ETHERE4L <${SENDER_EMAIL}>`,
-                to: [cliente.email],
-                subject: `Confirmación de Pedido ${jobId.slice(-6)}`,
-                html: getPaymentConfirmedEmail(cliente, pedido, jobId, trackingUrl),
-                attachments: [
-                    { filename: `Orden_${jobId.slice(-6)}.pdf`, content: pdfBuffer }
-                ]
-            });
-
-            if (ADMIN_EMAIL) {
-                await resend.emails.send({
-                    from: `System <${SENDER_EMAIL}>`,
-                    to: [ADMIN_EMAIL],
-                    subject: `💰 NUEVA VENTA - ${jobId.slice(-6)}`,
-                    html: getEmailTemplate(cliente, pedido, jobId, true),
+            try {
+                const clientEmailRes = await resend.emails.send({
+                    from: `ETHERE4L <${SENDER_EMAIL}>`,
+                    to: [cliente.email],
+                    subject: `Confirmación de Pedido ${jobId.slice(-6)}`,
+                    html: getPaymentConfirmedEmail(cliente, pedido, jobId, trackingUrl),
                     attachments: [
                         { filename: `Orden_${jobId.slice(-6)}.pdf`, content: pdfBuffer }
                     ]
                 });
+
+                logger.info('CLIENT_EMAIL_SENT', { 
+                    orderId: jobId, 
+                    email: cliente.email, 
+                    resendId: clientEmailRes.id,
+                    resendFrom: clientEmailRes.from,
+                    resendTo: clientEmailRes.to
+                });
+
+                if (ADMIN_EMAIL) {
+                    const adminEmailRes = await resend.emails.send({
+                        from: `System <${SENDER_EMAIL}>`,
+                        to: [ADMIN_EMAIL],
+                        subject: `💰 NUEVA VENTA - ${jobId.slice(-6)}`,
+                        html: getEmailTemplate(cliente, pedido, jobId, true),
+                        attachments: [
+                            { filename: `Orden_${jobId.slice(-6)}.pdf`, content: pdfBuffer }
+                        ]
+                    });
+
+                    logger.info('ADMIN_EMAIL_SENT', { 
+                        orderId: jobId, 
+                        resendId: adminEmailRes.id 
+                    });
+                }
+            } catch (emailError) {
+                // Specific email error logging
+                logger.error('RESEND_API_ERROR', { 
+                    orderId: jobId, 
+                    error: emailError.message,
+                    statusCode: emailError.statusCode || 'N/A',
+                    name: emailError.name
+                });
+                // Don't throw — allow process to continue
             }
         }
     } catch (e) {
