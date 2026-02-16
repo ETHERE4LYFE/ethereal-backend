@@ -14,18 +14,14 @@
 //   ✅ Admin endpoints unaffected (still use Authorization header)
 //   ✅ Per-order tokens (order_token) still via Authorization header (not stored client-side)
 // =========================================================
-// CHANGELOG FIX (EMAIL OBSERVABILITY):
-//   ✅ Added Resend response logging in processOrderBackground
-//   ✅ Added specific error handling for email failures
-//   ✅ Added Resend response logging in magic link endpoint
-//   ✅ Improved debugging capabilities without breaking functionality
-// =========================================================
-// CHANGELOG FIX (CORS PREFLIGHT):
+// CHANGELOG FIX (CORS PREFLIGHT + MIDDLEWARE ORDER):
 //   ✅ Fixed middleware order: trust proxy → CORS → preflight → webhook(raw) → json → cookie → routes
 //   ✅ Added explicit OPTIONS preflight handler: app.options('*', cors())
-//   ✅ Added CORS error handler to prevent 500 on blocked origins
-//   ✅ Moved cookieParser after express.json (only needed for route handlers)
-//   ✅ Moved request correlation after CORS (so OPTIONS gets logged correctly)
+//   ✅ Fixed CORS origin callback to use (null, false) instead of Error
+//   ✅ Added CORS error handler and global error handler
+//   ✅ Logger declared before any middleware that uses it
+//   ✅ Added maxAge and optionsSuccessStatus to CORS config
+//   ✅ ALLOWED_ORIGINS includes ethere4l.com for future migration
 // =========================================================
 
 // Cargar variables de entorno solo en local
@@ -40,8 +36,6 @@ const cors = require('cors');
 const Database = require('better-sqlite3');
 const { Resend } = require('resend');
 const cookieParser = require('cookie-parser');
-
-/* --- DEPENDENCIAS (SEGURIDAD & PAGOS) --- */
 const Stripe = require('stripe');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
@@ -49,7 +43,6 @@ const rateLimit = require('express-rate-limit');
 const crypto = require('crypto');
 const { randomUUID: uuidv4 } = require('crypto');
 
-// ✅ IMPORTACIONES CLAVE
 const { buildPDF } = require('./utils/pdfGenerator');
 const {
     getEmailTemplate,
@@ -76,14 +69,11 @@ const ADMIN_PASS_HASH = process.env.ADMIN_PASS_HASH;
 const STRIPE_WEBHOOK_SECRET = (process.env.STRIPE_WEBHOOK_SECRET || '').trim();
 
 // ===============================
-// 0.0 COOKIE CONFIGURATION (PHASE 0)
+// 0.0 COOKIE CONFIGURATION
 // ===============================
 const COOKIE_NAME = 'ethere4l_session';
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
-/**
- * Returns cookie options for the session cookie.
- */
 function getSessionCookieOptions(maxAgeDays) {
     return {
         httpOnly: true,
@@ -94,10 +84,6 @@ function getSessionCookieOptions(maxAgeDays) {
     };
 }
 
-/**
- * Returns cookie options to CLEAR the session cookie.
- * Must match the options used to SET it (except maxAge).
- */
 function getClearCookieOptions() {
     return {
         httpOnly: true,
@@ -108,7 +94,7 @@ function getClearCookieOptions() {
 }
 
 // ===============================
-// 0.1 HELPER: SANITIZACIÓN NUMÉRICA
+// 0.1 HELPERS
 // ===============================
 function parseSafeNumber(value, fallback = 0) {
     if (typeof value === 'number' && !isNaN(value)) return value;
@@ -118,9 +104,6 @@ function parseSafeNumber(value, fallback = 0) {
     return isNaN(number) ? fallback : number;
 }
 
-// ===============================
-// 0.2 HELPER: TOKEN PASSWORDLESS POR PEDIDO
-// ===============================
 function generateOrderToken(orderId, email) {
     return jwt.sign(
         { o: orderId, e: email },
@@ -167,9 +150,6 @@ function createCustomerSession(email, req) {
     return token;
 }
 
-// ===============================
-// 0.3 HELPER: VALIDACIÓN DE EMAIL (RFC 5322 SIMPLIFICADA)
-// ===============================
 function validateEmail(email) {
     if (!email || typeof email !== 'string') return false;
     const trimmed = email.trim();
@@ -178,7 +158,6 @@ function validateEmail(email) {
     const emailRegex = /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}$/;
     return emailRegex.test(trimmed);
 }
-
 
 // ================= CATÁLOGO ESTÁTICO =================
 let PRODUCTS_DB = [];
@@ -200,7 +179,7 @@ try {
 
 
 // ===============================
-// 1. DATABASE SETUP (PERSISTENCIA)
+// 1. DATABASE SETUP
 // ===============================
 const RAILWAY_VOLUME = '/app/data';
 const isRailway = fs.existsSync(RAILWAY_VOLUME);
@@ -282,7 +261,6 @@ try {
         console.log(`📦 Inventario inicializado con ${PRODUCTS_DB.length} productos`);
     }
 
-    // MIGRACIÓN SEGURA DE COLUMNAS
     try {
         const columns = db
             .prepare(`PRAGMA table_info(pedidos)`)
@@ -332,8 +310,7 @@ try {
 const app = express();
 
 // ===============================
-// OBSERVABILIDAD: LOGGER ESTRUCTURADO
-// (Declared early so all middlewares can use it)
+// LOGGER (declared early — used by middleware below)
 // ===============================
 const LOG_DIR = isRailway ? path.join(RAILWAY_VOLUME, 'logs') : path.join(__dirname, 'logs');
 if (!fs.existsSync(LOG_DIR)) {
@@ -382,13 +359,13 @@ function incrementErrorCount() {
 
 const PORT = process.env.PORT || 3000;
 const SERVER_START_TIME = Date.now();
-const BACKEND_VERSION = '2.2.2';
-
+const BACKEND_VERSION = '2.3.0';
 
 // ===============================
-// CORS CONFIGURATION
-// (Declared as reusable config object BEFORE middleware chain)
+// CORS CONFIG (declared before middleware chain)
 // ===============================
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://ethereal-frontend.netlify.app';
+
 const ALLOWED_ORIGINS = [
     'https://ethereal-frontend.netlify.app',
     'https://ethere4l.com',
@@ -396,65 +373,53 @@ const ALLOWED_ORIGINS = [
     'http://localhost:5500',
     'http://127.0.0.1:5500',
     'http://localhost:3001',
-    process.env.FRONTEND_URL
+    'http://localhost:3000',
+    FRONTEND_URL
 ].filter(Boolean);
 
-// Remove duplicates (in case FRONTEND_URL matches one already listed)
 const UNIQUE_ORIGINS = [...new Set(ALLOWED_ORIGINS)];
 
 const corsOptions = {
     origin: function(origin, callback) {
-        // Allow requests with no origin (Stripe webhooks, server-to-server, curl, etc.)
         if (!origin) return callback(null, true);
-
         if (UNIQUE_ORIGINS.indexOf(origin) !== -1) {
             return callback(null, true);
         }
-
         logger.warn('CORS_BLOCKED', { origin });
-        // Return false instead of Error to prevent 500 — browser gets empty CORS headers = blocked
         return callback(null, false);
     },
     methods: ['GET', 'POST', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
     credentials: true,
-    maxAge: 86400,          // Cache preflight for 24h — reduces OPTIONS requests
-    optionsSuccessStatus: 204  // Some legacy browsers choke on 200 for OPTIONS
+    maxAge: 86400,
+    optionsSuccessStatus: 204
 };
 
 
 // =========================================================
 // MIDDLEWARE CHAIN — CORRECT ORDER
 // =========================================================
-// The order matters critically for Express:
-//
-//   1. trust proxy        — Must be first (affects req.ip, req.secure, req.protocol)
-//   2. CORS middleware    — Must handle headers BEFORE any route logic
-//   3. OPTIONS preflight  — Must respond to OPTIONS BEFORE body parsers consume it
-//   4. Stripe webhook     — Must get raw body BEFORE express.json() parses it
-//   5. express.json()     — Global JSON parser for all other routes
-//   6. cookieParser()     — Parses cookies for route handlers
-//   7. Request correlation — Logging (after CORS so OPTIONS are logged correctly)
-//   8. Rate limiters      — Applied per-route, not global
-//   9. Routes             — Actual endpoint handlers
-//  10. CORS error handler — Catches CORS middleware errors
-//  11. Global error handler — Catches everything else
+//   1. trust proxy
+//   2. CORS middleware (headers on ALL responses)
+//   3. OPTIONS preflight handler (responds to all OPTIONS)
+//   4. Stripe webhook (raw body, BEFORE express.json)
+//   5. express.json()
+//   6. cookieParser()
+//   7. Request correlation / logging
+//   8. Routes
+//   9. Error handlers
 // =========================================================
 
 // --- STEP 1: Trust proxy ---
 app.set('trust proxy', 1);
 
-// --- STEP 2: CORS middleware (adds headers to ALL responses) ---
+// --- STEP 2: CORS middleware ---
 app.use(cors(corsOptions));
 
-// --- STEP 3: Explicit preflight handler for ALL routes ---
-// This ensures OPTIONS requests get a proper 204 response with CORS headers.
-// Without this, OPTIONS hits Express's default 404 handler (no CORS headers).
+// --- STEP 3: Explicit preflight handler ---
 app.options('*', cors(corsOptions));
 
-// --- STEP 4: Stripe webhook (MUST be before express.json) ---
-// Stripe needs the raw body to verify webhook signatures.
-// If express.json() runs first, it consumes the body and Stripe verification fails.
+// --- STEP 4: Stripe webhook (BEFORE express.json) ---
 app.post('/api/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
     const sig = req.headers['stripe-signature'];
     let event;
@@ -466,18 +431,25 @@ app.post('/api/webhook', express.raw({ type: 'application/json' }), async (req, 
         return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
+    logger.info('WEBHOOK_RECEIVED', { type: event.type, eventId: event.id });
+
     if (event.type === 'checkout.session.completed') {
         const session = event.data.object;
-        await handleStripeSuccess(session);
+        try {
+            await handleStripeSuccess(session);
+            logger.info('WEBHOOK_PROCESSED', { orderId: session.metadata?.order_id });
+        } catch (e) {
+            logger.error('WEBHOOK_HANDLER_ERROR', { error: e.message, stack: e.stack });
+        }
     }
 
     res.json({ received: true });
 });
 
-// --- STEP 5: JSON body parser (for all routes EXCEPT webhook above) ---
+// --- STEP 5: JSON body parser ---
 app.use(express.json());
 
-// --- STEP 6: Cookie parser (needed for session cookie reading) ---
+// --- STEP 6: Cookie parser ---
 app.use(cookieParser());
 
 // --- STEP 7: Request correlation & logging ---
@@ -487,14 +459,16 @@ app.use((req, res, next) => {
 
     res.on('finish', () => {
         const duration = Date.now() - start;
-        logger.info('HTTP_REQUEST', {
-            requestId: req.requestId,
-            method: req.method,
-            path: req.originalUrl,
-            status: res.statusCode,
-            ip: req.ip,
-            durationMs: duration
-        });
+        if (req.originalUrl !== '/health' && req.originalUrl !== '/metrics') {
+            logger.info('HTTP_REQUEST', {
+                requestId: req.requestId,
+                method: req.method,
+                path: req.originalUrl,
+                status: res.statusCode,
+                ip: req.ip,
+                durationMs: duration
+            });
+        }
         if (res.statusCode >= 500) {
             incrementErrorCount();
         }
@@ -503,9 +477,8 @@ app.use((req, res, next) => {
     next();
 });
 
-
 // ===============================
-// RATE LIMITERS (defined for per-route use)
+// RATE LIMITERS
 // ===============================
 const magicLinkLimiter = rateLimit({
     windowMs: 60 * 60 * 1000,
@@ -525,9 +498,8 @@ const trackingLimiter = rateLimit({
     message: "Demasiadas solicitudes de tracking."
 });
 
-
 // ===============================
-// RESEND (Email) CONFIG
+// RESEND CONFIG
 // ===============================
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'ethere4lyfe@gmail.com';
@@ -543,7 +515,7 @@ if (RESEND_API_KEY) {
 
 
 // ===============================
-// MIDDLEWARE: Admin JWT (Authorization header — unchanged)
+// AUTH MIDDLEWARES
 // ===============================
 function verifyToken(req, res, next) {
     const bearerHeader = req.headers['authorization'];
@@ -560,14 +532,9 @@ function verifyToken(req, res, next) {
     }
 }
 
-// ===============================
-// MIDDLEWARE: Customer Session (PHASE 0: COOKIE-FIRST, Authorization header fallback)
-// ===============================
 function verifyCustomerSession(req, res, next) {
-    // 1. Try cookie first (new secure flow)
     let token = req.cookies[COOKIE_NAME];
 
-    // 2. Fallback to Authorization header (backward compatibility)
     if (!token) {
         const auth = req.headers.authorization;
         if (auth && auth.startsWith('Bearer ')) {
@@ -617,11 +584,15 @@ function verifyCustomerSession(req, res, next) {
 
 
 // ===============================
-// 4. API ENDPOINTS (CLIENTE)
+// ROUTES
 // ===============================
 
 app.get('/', (req, res) => {
-    res.json({ status: 'online', service: 'ETHERE4L Backend v' + BACKEND_VERSION, mode: 'Stripe Enabled + HttpOnly Cookies + Email Observability' });
+    res.json({
+        status: 'online',
+        service: 'ETHERE4L Backend v' + BACKEND_VERSION,
+        mode: 'Stripe + HttpOnly Cookies + CORS Fixed'
+    });
 });
 
 // ===============================
@@ -656,6 +627,7 @@ app.get('/health', (req, res) => {
         },
         node: process.version,
         version: BACKEND_VERSION,
+        cors: { originsCount: UNIQUE_ORIGINS.length, preflightEnabled: true },
         timestamp: new Date().toISOString()
     });
 });
@@ -761,7 +733,6 @@ app.post('/api/create-checkout-session', async (req, res) => {
         }
 
         const tempOrderId = `ord_${Date.now()}_${Math.random().toString(36).slice(2,6)}`;
-        const FRONTEND_URL = process.env.FRONTEND_URL || req.headers.origin || 'https://ethereal-frontend.netlify.app';
 
         let lineItems = [];
         let pesoTotal = 0;
@@ -926,7 +897,6 @@ app.post('/api/create-checkout-session', async (req, res) => {
     }
 });
 
-// (LEGACY)
 app.post('/api/crear-pedido', (req, res) => {
     res.json({ success: true, message: "Use /api/create-checkout-session for payments" });
 });
@@ -1000,9 +970,8 @@ app.get('/api/orders/track/:orderId', trackingLimiter, (req, res) => {
 
 
 // ===============================
-// 5. API ENDPOINTS (ADMIN)
+// ADMIN
 // ===============================
-
 app.post('/api/admin/login', adminLimiter, async (req, res) => {
     try {
         const { password } = req.body;
@@ -1059,12 +1028,9 @@ app.post('/api/magic-link', magicLinkLimiter, async (req, res) => {
         if (hasOrders && resend) {
             const magicToken = jwt.sign(
                 { email: cleanEmail, scope: 'read_orders' },
-                process.env.JWT_SECRET,
+                JWT_SECRET,
                 { expiresIn: '24h' }
             );
-
-            const FRONTEND_URL =
-                process.env.FRONTEND_URL || 'https://ethereal-frontend.netlify.app';
 
             const link = `${FRONTEND_URL}/mis-pedidos.html?token=${magicToken}`;
 
@@ -1078,9 +1044,7 @@ app.post('/api/magic-link', magicLinkLimiter, async (req, res) => {
 
                 logger.info('MAGIC_LINK_SENT', {
                     email: cleanEmail,
-                    resendId: magicRes.id,
-                    resendFrom: magicRes.from,
-                    resendTo: magicRes.to
+                    resendId: magicRes?.id || 'unknown'
                 });
             } catch (emailErr) {
                 logger.error('MAGIC_LINK_EMAIL_FAILED', {
@@ -1104,7 +1068,7 @@ app.post('/api/magic-link', magicLinkLimiter, async (req, res) => {
 
 
 // ===============================
-// SESSION START (PHASE 0: SETS HTTPONLY COOKIE)
+// SESSION START
 // ===============================
 app.get('/api/session/start', (req, res) => {
     const { token } = req.query;
@@ -1136,10 +1100,10 @@ app.get('/api/session/start', (req, res) => {
 
 
 // ===============================
-// SESSION LOGOUT (PHASE 0)
+// SESSION LOGOUT
 // ===============================
 app.post('/api/session/logout', (req, res) => {
-    const token = req.cookies[COOKIE_NAME];
+    const token = req.cookies ? req.cookies[COOKIE_NAME] : null;
 
     if (token) {
         try {
@@ -1155,13 +1119,12 @@ app.post('/api/session/logout', (req, res) => {
     }
 
     res.clearCookie(COOKIE_NAME, getClearCookieOptions());
-
     res.json({ success: true });
 });
 
 
 // ===============================
-// CUSTOMER ORDERS (PHASE 0: COOKIE AUTH)
+// CUSTOMER ORDERS
 // ===============================
 app.get('/api/customer/orders', verifyCustomerSession, (req, res) => {
     try {
@@ -1217,7 +1180,7 @@ app.get('/api/my-orders', (req, res) => {
     const token = auth.split(' ')[1];
 
     try {
-        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        const decoded = jwt.verify(token, JWT_SECRET);
 
         if (decoded.scope !== 'read_orders') {
             return res.sendStatus(403);
@@ -1317,17 +1280,21 @@ app.post('/api/admin/update-shipping', verifyToken, async (req, res) => {
     );
 
     if (resend) {
-        await resend.emails.send({
-            from: `ETHERE4L <${SENDER_EMAIL}>`,
-            to: [order.email],
-            subject: `Actualización de tu pedido`,
-            html: `
-                <h2>Estado actualizado</h2>
-                <p><strong>${getStatusDescription(status)}</strong></p>
-                <p>Pedido: ${orderId}</p>
-                ${trackingNumber ? `<p>Guía: ${trackingNumber}</p>` : ''}
-            `
-        });
+        try {
+            await resend.emails.send({
+                from: `ETHERE4L <${SENDER_EMAIL}>`,
+                to: [order.email],
+                subject: `Actualización de tu pedido`,
+                html: `
+                    <h2>Estado actualizado</h2>
+                    <p><strong>${getStatusDescription(status)}</strong></p>
+                    <p>Pedido: ${orderId}</p>
+                    ${trackingNumber ? `<p>Guía: ${trackingNumber}</p>` : ''}
+                `
+            });
+        } catch (emailErr) {
+            logger.error('SHIPPING_UPDATE_EMAIL_FAILED', { orderId, error: emailErr.message });
+        }
     }
 
     res.json({ success: true });
@@ -1345,9 +1312,8 @@ function getStatusDescription(status) {
 
 
 // ===============================
-// 6. FUNCIONES INTERNAS (WEBHOOK LOGIC)
+// WEBHOOK HANDLER
 // ===============================
-
 async function handleStripeSuccess(session) {
     const orderId = session.metadata?.order_id;
     if (!orderId) {
@@ -1355,7 +1321,10 @@ async function handleStripeSuccess(session) {
         return;
     }
 
-    if (!dbPersistent) return;
+    if (!dbPersistent) {
+        logger.error('WEBHOOK_DB_NOT_PERSISTENT', { orderId });
+        return;
+    }
 
     try {
         const existingOrder = db.prepare(`SELECT status, data FROM pedidos WHERE id = ?`).get(orderId);
@@ -1403,9 +1372,11 @@ async function handleStripeSuccess(session) {
 
         confirmPaymentTransaction();
 
+        logger.info('PAYMENT_CONFIRMED_DB', { orderId, paymentIntent: session.payment_intent });
+
         const row = db.prepare(`SELECT data FROM pedidos WHERE id=?`).get(orderId);
         if (!row) {
-            logger.error('WEBHOOK_DATA_MISSING', { orderId });
+            logger.error('WEBHOOK_DATA_MISSING_AFTER_UPDATE', { orderId });
             return;
         }
 
@@ -1415,15 +1386,15 @@ async function handleStripeSuccess(session) {
         const cliente = parsed.cliente;
         const pedido = parsed.pedido;
 
-        logger.info('PAGO_CONFIRMADO', { orderId, total: pedido.total });
+        logger.info('PAGO_CONFIRMADO', { orderId, total: pedido.total, email: cliente.email });
 
-        setImmediate(() => {
-            processOrderBackground(orderId, cliente, pedido)
-                .catch(e => {
-                    logger.error('BACKGROUND_WORKER_ERROR', { orderId, error: e.message });
-                    incrementErrorCount();
-                });
-        });
+        // Process emails synchronously to ensure they complete before webhook response
+        try {
+            await processOrderBackground(orderId, cliente, pedido);
+            logger.info('WEBHOOK_EMAILS_COMPLETED', { orderId });
+        } catch (e) {
+            logger.error('WEBHOOK_EMAIL_ERROR', { orderId, error: e.message });
+        }
 
     } catch (e) {
         logger.error('WEBHOOK_PROCESSING_ERROR', { orderId, error: e.message, stack: e.stack });
@@ -1433,13 +1404,16 @@ async function handleStripeSuccess(session) {
 
 async function processOrderBackground(jobId, cliente, pedido) {
     try {
+        logger.info('EMAIL_PROCESS_START', { orderId: jobId, email: cliente.email, resendConfigured: !!resend });
+
         const pdfBuffer = await buildPDF(cliente, pedido, jobId, 'CLIENTE');
+        logger.info('PDF_GENERATED', { orderId: jobId, pdfSize: pdfBuffer.length });
 
         const accessToken = generateOrderToken(jobId, cliente.email);
-        const FRONTEND_URL = process.env.FRONTEND_URL || 'https://ethereal-frontend.netlify.app';
         const trackingUrl = `${FRONTEND_URL}/pedido-ver.html?id=${jobId}&token=${accessToken}`;
 
         if (resend) {
+            // Client email
             try {
                 const clientEmailRes = await resend.emails.send({
                     from: `ETHERE4L <${SENDER_EMAIL}>`,
@@ -1454,12 +1428,20 @@ async function processOrderBackground(jobId, cliente, pedido) {
                 logger.info('CLIENT_EMAIL_SENT', {
                     orderId: jobId,
                     email: cliente.email,
-                    resendId: clientEmailRes.id,
-                    resendFrom: clientEmailRes.from,
-                    resendTo: clientEmailRes.to
+                    resendId: clientEmailRes?.id || 'unknown'
                 });
+            } catch (clientEmailErr) {
+                logger.error('CLIENT_EMAIL_FAILED', {
+                    orderId: jobId,
+                    email: cliente.email,
+                    error: clientEmailErr.message,
+                    statusCode: clientEmailErr.statusCode || 'N/A'
+                });
+            }
 
-                if (ADMIN_EMAIL) {
+            // Admin email
+            if (ADMIN_EMAIL) {
+                try {
                     const adminEmailRes = await resend.emails.send({
                         from: `System <${SENDER_EMAIL}>`,
                         to: [ADMIN_EMAIL],
@@ -1472,27 +1454,27 @@ async function processOrderBackground(jobId, cliente, pedido) {
 
                     logger.info('ADMIN_EMAIL_SENT', {
                         orderId: jobId,
-                        resendId: adminEmailRes.id
+                        resendId: adminEmailRes?.id || 'unknown'
+                    });
+                } catch (adminEmailErr) {
+                    logger.error('ADMIN_EMAIL_FAILED', {
+                        orderId: jobId,
+                        error: adminEmailErr.message
                     });
                 }
-            } catch (emailError) {
-                logger.error('RESEND_API_ERROR', {
-                    orderId: jobId,
-                    error: emailError.message,
-                    statusCode: emailError.statusCode || 'N/A',
-                    name: emailError.name
-                });
             }
+        } else {
+            logger.warn('RESEND_NOT_CONFIGURED_SKIPPING_EMAILS', { orderId: jobId });
         }
     } catch (e) {
-        logger.error('EMAIL_PDF_ERROR', { jobId, error: e.message });
+        logger.error('EMAIL_PDF_ERROR', { jobId, error: e.message, stack: e.stack });
         incrementErrorCount();
     }
 }
 
 
 // ===============================
-// CLEANUP: Liberar stock de pedidos PENDIENTES antiguos
+// CLEANUP
 // ===============================
 function cleanupStaleReservations() {
     if (!dbPersistent) return;
@@ -1543,9 +1525,6 @@ setTimeout(cleanupStaleReservations, 10000);
 // ===============================
 // ERROR HANDLERS (after all routes)
 // ===============================
-
-// CORS error handler — catches when cors() middleware rejects an origin
-// Without this, a CORS rejection produces a raw Express error (500, no CORS headers)
 app.use((err, req, res, next) => {
     if (err.message && err.message.toLowerCase().includes('cors')) {
         logger.warn('CORS_ERROR_HANDLED', { origin: req.headers.origin, path: req.originalUrl });
@@ -1554,7 +1533,6 @@ app.use((err, req, res, next) => {
     next(err);
 });
 
-// Global error handler — catches unexpected errors
 app.use((err, req, res, next) => {
     logger.error('UNHANDLED_ROUTE_ERROR', {
         error: err.message,
@@ -1574,8 +1552,18 @@ const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 ETHERE4L Backend V${BACKEND_VERSION} corriendo en puerto ${PORT}`);
     console.log(`🔒 Auth: HttpOnly Cookie (Phase 0 Security)`);
     console.log(`🍪 Cookie: ${COOKIE_NAME} | SameSite=${IS_PRODUCTION ? 'None' : 'Lax'} | Secure=${IS_PRODUCTION}`);
-    console.log(`🌐 CORS: ${UNIQUE_ORIGINS.length} origins allowed | credentials: true | preflight: explicit`);
-    logger.info('SERVER_STARTED', { port: PORT, version: BACKEND_VERSION, railway: isRailway, authMode: 'httponly_cookie', origins: UNIQUE_ORIGINS.length });
+    console.log(`🌐 CORS: ${UNIQUE_ORIGINS.length} origins | preflight: explicit | credentials: true`);
+    console.log(`📧 Email: ${resend ? 'Resend ACTIVE' : 'DISABLED'}`);
+    console.log(`💳 Stripe: ${STRIPE_WEBHOOK_SECRET ? 'Webhook configured' : 'NO webhook secret'}`);
+    logger.info('SERVER_STARTED', {
+        port: PORT,
+        version: BACKEND_VERSION,
+        railway: isRailway,
+        authMode: 'httponly_cookie',
+        corsOrigins: UNIQUE_ORIGINS.length,
+        emailActive: !!resend,
+        stripeWebhook: !!STRIPE_WEBHOOK_SECRET
+    });
 });
 
 process.on('SIGTERM', () => {
