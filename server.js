@@ -20,6 +20,13 @@
 //   ✅ Added Resend response logging in magic link endpoint
 //   ✅ Improved debugging capabilities without breaking functionality
 // =========================================================
+// CHANGELOG FIX (CORS PREFLIGHT):
+//   ✅ Fixed middleware order: trust proxy → CORS → preflight → webhook(raw) → json → cookie → routes
+//   ✅ Added explicit OPTIONS preflight handler: app.options('*', cors())
+//   ✅ Added CORS error handler to prevent 500 on blocked origins
+//   ✅ Moved cookieParser after express.json (only needed for route handlers)
+//   ✅ Moved request correlation after CORS (so OPTIONS gets logged correctly)
+// =========================================================
 
 // Cargar variables de entorno solo en local
 if (process.env.NODE_ENV !== 'production') {
@@ -39,7 +46,8 @@ const Stripe = require('stripe');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const rateLimit = require('express-rate-limit');
-
+const crypto = require('crypto');
+const { randomUUID: uuidv4 } = require('crypto');
 
 // ✅ IMPORTACIONES CLAVE
 const { buildPDF } = require('./utils/pdfGenerator');
@@ -64,7 +72,7 @@ const JWT_SECRET = (function() {
     return 'secret_dev_key_change_in_prod';
 })();
 
-const ADMIN_PASS_HASH = process.env.ADMIN_PASS_HASH; 
+const ADMIN_PASS_HASH = process.env.ADMIN_PASS_HASH;
 const STRIPE_WEBHOOK_SECRET = (process.env.STRIPE_WEBHOOK_SECRET || '').trim();
 
 // ===============================
@@ -75,26 +83,14 @@ const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
 /**
  * Returns cookie options for the session cookie.
- * 
- * SECURITY RATIONALE:
- * - httpOnly: true → JavaScript cannot read the cookie (XSS protection)
- * - secure: true in production → Cookie only sent over HTTPS
- * - sameSite: 'None' → Required for cross-origin (Netlify frontend ↔ Railway backend)
- *   NOTE: SameSite=Strict would BLOCK the cookie because frontend and backend are different domains.
- *   SameSite=None + Secure is the correct combination for cross-origin cookie auth.
- * - path: '/' → Cookie sent to all API routes
- * - maxAge: matches session expiry
- * 
- * FUTURE: If frontend and backend move to same domain (e.g., api.ethere4l.com),
- *         switch to SameSite=Strict and set domain='.ethere4l.com'
  */
 function getSessionCookieOptions(maxAgeDays) {
     return {
         httpOnly: true,
-        secure: IS_PRODUCTION,          // HTTPS only in production
-        sameSite: IS_PRODUCTION ? 'None' : 'Lax',  // None for cross-origin prod; Lax for localhost
+        secure: IS_PRODUCTION,
+        sameSite: IS_PRODUCTION ? 'None' : 'Lax',
         path: '/',
-        maxAge: maxAgeDays * 24 * 60 * 60 * 1000  // Convert days to milliseconds
+        maxAge: maxAgeDays * 24 * 60 * 60 * 1000
     };
 }
 
@@ -110,13 +106,6 @@ function getClearCookieOptions() {
         path: '/'
     };
 }
-
-// RATE LIMITER: MAGIC LINK
-const magicLinkLimiter = rateLimit({
-    windowMs: 60 * 60 * 1000,
-    max: 5,
-    message: "Demasiadas solicitudes. Intenta más tarde."
-});
 
 // ===============================
 // 0.1 HELPER: SANITIZACIÓN NUMÉRICA
@@ -139,9 +128,6 @@ function generateOrderToken(orderId, email) {
         { expiresIn: '7d' }
     );
 }
-
-const crypto = require('crypto');
-const { randomUUID: uuidv4 } = require('crypto');
 
 const CUSTOMER_SESSION_DAYS = 180;
 
@@ -230,7 +216,7 @@ let dbPersistent = false;
 
 try {
     console.log(`🔌 Conectando DB en: ${DB_PATH}`);
-    db = new Database(DB_PATH); 
+    db = new Database(DB_PATH);
     db.pragma('journal_mode = WAL');
 
     db.exec(`
@@ -341,20 +327,13 @@ try {
 
 
 // ===============================
-// 2. CONFIGURACIÓN APP & RESEND
+// 2. APP INITIALIZATION
 // ===============================
 const app = express();
-app.set('trust proxy', 1);
-
-// ===============================
-// COOKIE PARSER (PHASE 0: Required to read HttpOnly cookies)
-// ===============================
-// Must be added BEFORE routes that read cookies
-// No secret needed — we don't use signed cookies (JWT is self-validating)
-app.use(cookieParser());
 
 // ===============================
 // OBSERVABILIDAD: LOGGER ESTRUCTURADO
+// (Declared early so all middlewares can use it)
 // ===============================
 const LOG_DIR = isRailway ? path.join(RAILWAY_VOLUME, 'logs') : path.join(__dirname, 'logs');
 if (!fs.existsSync(LOG_DIR)) {
@@ -403,14 +382,165 @@ function incrementErrorCount() {
 
 const PORT = process.env.PORT || 3000;
 const SERVER_START_TIME = Date.now();
-const BACKEND_VERSION = '2.2.1';
+const BACKEND_VERSION = '2.2.2';
 
-// Rate Limiter para Admin
+
+// ===============================
+// CORS CONFIGURATION
+// (Declared as reusable config object BEFORE middleware chain)
+// ===============================
+const ALLOWED_ORIGINS = [
+    'https://ethereal-frontend.netlify.app',
+    'https://ethere4l.com',
+    'https://www.ethere4l.com',
+    'http://localhost:5500',
+    'http://127.0.0.1:5500',
+    'http://localhost:3001',
+    process.env.FRONTEND_URL
+].filter(Boolean);
+
+// Remove duplicates (in case FRONTEND_URL matches one already listed)
+const UNIQUE_ORIGINS = [...new Set(ALLOWED_ORIGINS)];
+
+const corsOptions = {
+    origin: function(origin, callback) {
+        // Allow requests with no origin (Stripe webhooks, server-to-server, curl, etc.)
+        if (!origin) return callback(null, true);
+
+        if (UNIQUE_ORIGINS.indexOf(origin) !== -1) {
+            return callback(null, true);
+        }
+
+        logger.warn('CORS_BLOCKED', { origin });
+        // Return false instead of Error to prevent 500 — browser gets empty CORS headers = blocked
+        return callback(null, false);
+    },
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    credentials: true,
+    maxAge: 86400,          // Cache preflight for 24h — reduces OPTIONS requests
+    optionsSuccessStatus: 204  // Some legacy browsers choke on 200 for OPTIONS
+};
+
+
+// =========================================================
+// MIDDLEWARE CHAIN — CORRECT ORDER
+// =========================================================
+// The order matters critically for Express:
+//
+//   1. trust proxy        — Must be first (affects req.ip, req.secure, req.protocol)
+//   2. CORS middleware    — Must handle headers BEFORE any route logic
+//   3. OPTIONS preflight  — Must respond to OPTIONS BEFORE body parsers consume it
+//   4. Stripe webhook     — Must get raw body BEFORE express.json() parses it
+//   5. express.json()     — Global JSON parser for all other routes
+//   6. cookieParser()     — Parses cookies for route handlers
+//   7. Request correlation — Logging (after CORS so OPTIONS are logged correctly)
+//   8. Rate limiters      — Applied per-route, not global
+//   9. Routes             — Actual endpoint handlers
+//  10. CORS error handler — Catches CORS middleware errors
+//  11. Global error handler — Catches everything else
+// =========================================================
+
+// --- STEP 1: Trust proxy ---
+app.set('trust proxy', 1);
+
+// --- STEP 2: CORS middleware (adds headers to ALL responses) ---
+app.use(cors(corsOptions));
+
+// --- STEP 3: Explicit preflight handler for ALL routes ---
+// This ensures OPTIONS requests get a proper 204 response with CORS headers.
+// Without this, OPTIONS hits Express's default 404 handler (no CORS headers).
+app.options('*', cors(corsOptions));
+
+// --- STEP 4: Stripe webhook (MUST be before express.json) ---
+// Stripe needs the raw body to verify webhook signatures.
+// If express.json() runs first, it consumes the body and Stripe verification fails.
+app.post('/api/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+    const sig = req.headers['stripe-signature'];
+    let event;
+
+    try {
+        event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
+    } catch (err) {
+        logger.error('WEBHOOK_SIGNATURE_FAIL', { error: err.message });
+        return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    if (event.type === 'checkout.session.completed') {
+        const session = event.data.object;
+        await handleStripeSuccess(session);
+    }
+
+    res.json({ received: true });
+});
+
+// --- STEP 5: JSON body parser (for all routes EXCEPT webhook above) ---
+app.use(express.json());
+
+// --- STEP 6: Cookie parser (needed for session cookie reading) ---
+app.use(cookieParser());
+
+// --- STEP 7: Request correlation & logging ---
+app.use((req, res, next) => {
+    req.requestId = `req_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+    const start = Date.now();
+
+    res.on('finish', () => {
+        const duration = Date.now() - start;
+        logger.info('HTTP_REQUEST', {
+            requestId: req.requestId,
+            method: req.method,
+            path: req.originalUrl,
+            status: res.statusCode,
+            ip: req.ip,
+            durationMs: duration
+        });
+        if (res.statusCode >= 500) {
+            incrementErrorCount();
+        }
+    });
+
+    next();
+});
+
+
+// ===============================
+// RATE LIMITERS (defined for per-route use)
+// ===============================
+const magicLinkLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000,
+    max: 5,
+    message: "Demasiadas solicitudes. Intenta más tarde."
+});
+
 const adminLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 10,
     message: "Demasiados intentos de acceso al panel."
 });
+
+const trackingLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 50,
+    message: "Demasiadas solicitudes de tracking."
+});
+
+
+// ===============================
+// RESEND (Email) CONFIG
+// ===============================
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'ethere4lyfe@gmail.com';
+const SENDER_EMAIL = 'orders@ethere4l.com';
+
+let resend = null;
+if (RESEND_API_KEY) {
+    resend = new Resend(RESEND_API_KEY);
+    console.log('📧 Sistema de correos ACTIVO');
+} else {
+    console.warn('⚠️ SIN API KEY DE RESEND - Correos desactivados');
+}
+
 
 // ===============================
 // MIDDLEWARE: Admin JWT (Authorization header — unchanged)
@@ -433,18 +563,6 @@ function verifyToken(req, res, next) {
 // ===============================
 // MIDDLEWARE: Customer Session (PHASE 0: COOKIE-FIRST, Authorization header fallback)
 // ===============================
-/**
- * PHASE 0 CHANGE:
- * - PRIMARY: Read JWT from HttpOnly cookie (COOKIE_NAME)
- * - FALLBACK: Read from Authorization header (backward compatibility during migration)
- * 
- * This allows:
- * 1. New frontend (cookie-based) to work immediately
- * 2. Old clients / API consumers that still send Authorization header to keep working
- * 3. Gradual migration without breaking anything
- * 
- * After full migration, the Authorization header fallback can be removed.
- */
 function verifyCustomerSession(req, res, next) {
     // 1. Try cookie first (new secure flow)
     let token = req.cookies[COOKIE_NAME];
@@ -492,7 +610,6 @@ function verifyCustomerSession(req, res, next) {
         next();
 
     } catch (e) {
-        // If cookie auth failed, clear the invalid cookie
         res.clearCookie(COOKIE_NAME, getClearCookieOptions());
         return res.sendStatus(403);
     }
@@ -500,122 +617,11 @@ function verifyCustomerSession(req, res, next) {
 
 
 // ===============================
-// REQUEST CORRELATION
-// ===============================
-app.use((req, res, next) => {
-    req.requestId = `req_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
-    const start = Date.now();
-
-    res.on('finish', () => {
-        const duration = Date.now() - start;
-        logger.info('HTTP_REQUEST', {
-            requestId: req.requestId,
-            method: req.method,
-            path: req.originalUrl,
-            status: res.statusCode,
-            ip: req.ip,
-            durationMs: duration
-        });
-        if (res.statusCode >= 500) {
-            incrementErrorCount();
-        }
-    });
-
-    next();
-});
-
-// ===============================
-// CORS CONFIGURATION (PHASE 0: credentials: true)
-// ===============================
-/**
- * PHASE 0 CRITICAL CHANGE:
- * - credentials: true → Required for cross-origin cookie transmission
- * - origin must be EXPLICIT (not '*') when credentials is true
- * - This is a browser requirement per the Fetch specification
- * 
- * WHY SameSite=None works here:
- * - Frontend: https://ethereal-frontend.netlify.app (Netlify)
- * - Backend: https://ethere4l-backend-production.up.railway.app (Railway)
- * - These are DIFFERENT origins → cross-origin → requires SameSite=None
- * - SameSite=None requires Secure=true (HTTPS only)
- * - Railway serves over HTTPS by default ✓
- * 
- * WHY this doesn't affect Stripe webhooks:
- * - Stripe webhooks are server-to-server HTTP POST requests
- * - They don't use cookies or CORS — they use signature verification
- * - The webhook endpoint (/api/webhook) is hit directly by Stripe servers
- */
-const ALLOWED_ORIGINS = [
-    'https://ethereal-frontend.netlify.app',
-    'http://localhost:5500',
-    'http://127.0.0.1:5500',
-    'http://localhost:3001',
-    process.env.FRONTEND_URL
-].filter(Boolean);
-
-app.use(cors({
-    origin: function(origin, callback) {
-        // Allow requests with no origin (Stripe webhooks, server-to-server, curl, etc.)
-        if (!origin) return callback(null, true);
-        
-        if (ALLOWED_ORIGINS.indexOf(origin) !== -1) {
-            return callback(null, true);
-        }
-        
-        logger.warn('CORS_BLOCKED', { origin });
-        return callback(new Error('CORS not allowed'), false);
-    },
-    methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
-    credentials: true  // ← PHASE 0: Required for Set-Cookie / Cookie headers cross-origin
-}));
-
-// Email config
-const RESEND_API_KEY = process.env.RESEND_API_KEY;
-const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'ethere4lyfe@gmail.com'; 
-const SENDER_EMAIL = 'orders@ethere4l.com';
-
-let resend = null;
-if (RESEND_API_KEY) {
-    resend = new Resend(RESEND_API_KEY);
-    console.log('📧 Sistema de correos ACTIVO');
-} else {
-    console.warn('⚠️ SIN API KEY DE RESEND - Correos desactivados');
-}
-
-// ===============================
-// 3. SPECIAL ROUTES (WEBHOOKS)
-// ===============================
-
-// ⚠️ IMPORTANTE: El webhook debe ir ANTES de express.json()
-app.post('/api/webhook', express.raw({type: 'application/json'}), async (req, res) => {
-    const sig = req.headers['stripe-signature'];
-    let event;
-
-    try {
-        event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
-    } catch (err) {
-        logger.error('WEBHOOK_SIGNATURE_FAIL', { error: err.message });
-        return res.status(400).send(`Webhook Error: ${err.message}`);
-    }
-
-    if (event.type === 'checkout.session.completed') {
-        const session = event.data.object;
-        await handleStripeSuccess(session);
-    }
-
-    res.json({received: true});
-});
-
-// AHORA SÍ: Parser JSON global
-app.use(express.json());
-
-// ===============================
 // 4. API ENDPOINTS (CLIENTE)
 // ===============================
 
 app.get('/', (req, res) => {
-    res.json({ status: 'online', service: 'ETHERE4L Backend v2.2.1', mode: 'Stripe Enabled + HttpOnly Cookies + Email Observability' });
+    res.json({ status: 'online', service: 'ETHERE4L Backend v' + BACKEND_VERSION, mode: 'Stripe Enabled + HttpOnly Cookies + Email Observability' });
 });
 
 // ===============================
@@ -709,7 +715,7 @@ app.get('/metrics', (req, res) => {
 
 
 // ===============================
-// CHECKOUT SESSION (unchanged — no auth cookies involved)
+// CHECKOUT SESSION
 // ===============================
 app.post('/api/create-checkout-session', async (req, res) => {
     try {
@@ -717,16 +723,16 @@ app.post('/api/create-checkout-session', async (req, res) => {
 
         const customerEmail = customer?.email ? String(customer.email).trim().toLowerCase() : '';
         if (!validateEmail(customerEmail)) {
-            return res.status(400).json({ 
-                error: 'Email inválido. Verifica tu dirección de correo.' 
+            return res.status(400).json({
+                error: 'Email inválido. Verifica tu dirección de correo.'
             });
         }
 
         for (const item of items) {
             const cantidad = parseSafeNumber(item.cantidad, 0);
             if (!Number.isInteger(cantidad) || cantidad < 1 || cantidad > 10) {
-                return res.status(400).json({ 
-                    error: `Cantidad inválida para producto ${item.id || 'desconocido'}: ${item.cantidad}. Debe ser entre 1 y 10.` 
+                return res.status(400).json({
+                    error: `Cantidad inválida para producto ${item.id || 'desconocido'}: ${item.cantidad}. Debe ser entre 1 y 10.`
                 });
             }
         }
@@ -741,19 +747,19 @@ app.post('/api/create-checkout-session', async (req, res) => {
                 if (inventoryRow) {
                     const available = inventoryRow.stock - inventoryRow.reserved;
                     if (available < cantidadLimpia) {
-                        logger.warn('STOCK_INSUFICIENTE', { 
-                            productId: item.id, 
-                            requested: cantidadLimpia, 
-                            available 
+                        logger.warn('STOCK_INSUFICIENTE', {
+                            productId: item.id,
+                            requested: cantidadLimpia,
+                            available
                         });
-                        return res.status(400).json({ 
-                            error: `Stock insuficiente para "${item.nombre || item.id}". Disponible: ${Math.max(0, available)}` 
+                        return res.status(400).json({
+                            error: `Stock insuficiente para "${item.nombre || item.id}". Disponible: ${Math.max(0, available)}`
                         });
                     }
                 }
             }
         }
-        
+
         const tempOrderId = `ord_${Date.now()}_${Math.random().toString(36).slice(2,6)}`;
         const FRONTEND_URL = process.env.FRONTEND_URL || req.headers.origin || 'https://ethereal-frontend.netlify.app';
 
@@ -762,8 +768,8 @@ app.post('/api/create-checkout-session', async (req, res) => {
         let serverSubtotal = 0;
 
         for (const item of items) {
-            const dbProduct = PRODUCTS_DB.length > 0 
-                ? PRODUCTS_DB.find(p => String(p.id) === String(item.id)) 
+            const dbProduct = PRODUCTS_DB.length > 0
+                ? PRODUCTS_DB.find(p => String(p.id) === String(item.id))
                 : null;
 
             const productFinal = dbProduct || item;
@@ -783,7 +789,7 @@ app.post('/api/create-checkout-session', async (req, res) => {
             let productImages = [];
             if (dbProduct && dbProduct.fotos && dbProduct.fotos.length > 0) {
                 productImages = [dbProduct.fotos[0]];
-            } else if (item.imagen && item.imagen.startsWith('http')) { 
+            } else if (item.imagen && item.imagen.startsWith('http')) {
                 productImages = [item.imagen];
             }
 
@@ -798,7 +804,7 @@ app.post('/api/create-checkout-session', async (req, res) => {
                             id_producto: item.id
                         }
                     },
-                    unit_amount: Math.round(precioLimpio * 100), 
+                    unit_amount: Math.round(precioLimpio * 100),
                 },
                 quantity: cantidadLimpia,
             });
@@ -807,12 +813,12 @@ app.post('/api/create-checkout-session', async (req, res) => {
         const totalItems = items.reduce((acc, item) => acc + parseSafeNumber(item.cantidad, 1), 0);
         let costoEnvio = 0;
 
-        if (totalItems === 1) costoEnvio = 900; 
-        else if (totalItems === 2) costoEnvio = 1000; 
-        else if (totalItems === 3) costoEnvio = 1300; 
-        else costoEnvio = 1500; 
+        if (totalItems === 1) costoEnvio = 900;
+        else if (totalItems === 2) costoEnvio = 1000;
+        else if (totalItems === 3) costoEnvio = 1300;
+        else costoEnvio = 1500;
 
-        if (pesoTotal > 10.0) costoEnvio += 500; 
+        if (pesoTotal > 10.0) costoEnvio += 500;
 
         const pedidoSnapshot = {
             items: items.map(item => {
@@ -879,8 +885,8 @@ app.post('/api/create-checkout-session', async (req, res) => {
             } catch (txError) {
                 if (txError.message.startsWith('STOCK_INSUFICIENTE')) {
                     const parts = txError.message.split(':');
-                    return res.status(400).json({ 
-                        error: `Stock insuficiente para producto ${parts[1]}. Disponible: ${parts[2]}` 
+                    return res.status(400).json({
+                        error: `Stock insuficiente para producto ${parts[1]}. Disponible: ${parts[2]}`
                     });
                 }
                 logger.error('TRANSACTION_ERROR', { error: txError.message });
@@ -927,19 +933,11 @@ app.post('/api/crear-pedido', (req, res) => {
 
 
 // ===============================
-// TRACKING (per-order token via Authorization header — unchanged)
+// TRACKING
 // ===============================
-const trackingLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 50,
-    message: "Demasiadas solicitudes de tracking."
-});
-
 app.get('/api/orders/track/:orderId', trackingLimiter, (req, res) => {
     const { orderId } = req.params;
 
-    // This endpoint uses per-order tokens (Authorization header)
-    // NOT session cookies — because order detail links are shared via email
     const authHeader = req.headers.authorization;
     if (!authHeader) {
         return res.status(401).json({ error: 'Authorization requerido' });
@@ -1043,7 +1041,7 @@ app.post('/api/admin/login', adminLimiter, async (req, res) => {
 
 
 // ===============================
-// MAGIC LINK (with Resend response logging)
+// MAGIC LINK
 // ===============================
 app.post('/api/magic-link', magicLinkLimiter, async (req, res) => {
     try {
@@ -1078,20 +1076,19 @@ app.post('/api/magic-link', magicLinkLimiter, async (req, res) => {
                     html: getMagicLinkEmail(link)
                 });
 
-                logger.info('MAGIC_LINK_SENT', { 
+                logger.info('MAGIC_LINK_SENT', {
                     email: cleanEmail,
                     resendId: magicRes.id,
                     resendFrom: magicRes.from,
                     resendTo: magicRes.to
                 });
             } catch (emailErr) {
-                logger.error('MAGIC_LINK_EMAIL_FAILED', { 
-                    email: cleanEmail, 
+                logger.error('MAGIC_LINK_EMAIL_FAILED', {
+                    email: cleanEmail,
                     error: emailErr.message,
                     statusCode: emailErr.statusCode || 'N/A',
                     name: emailErr.name
                 });
-                // Still return success (anti-enumeration)
             }
         } else if (hasOrders && !resend) {
             logger.warn('MAGIC_LINK_RESEND_NOT_CONFIGURED', { email: cleanEmail });
@@ -1107,18 +1104,8 @@ app.post('/api/magic-link', magicLinkLimiter, async (req, res) => {
 
 
 // ===============================
-// SESSION START (PHASE 0: NOW SETS HTTPONLY COOKIE)
+// SESSION START (PHASE 0: SETS HTTPONLY COOKIE)
 // ===============================
-/**
- * PHASE 0 CRITICAL CHANGE:
- * 
- * BEFORE: Returns { token: "jwt..." } → frontend stores in localStorage
- * AFTER:  Sets HttpOnly cookie + returns { success: true, email: "..." }
- * 
- * The JWT is NEVER exposed to JavaScript.
- * The browser stores it as an HttpOnly cookie automatically.
- * All subsequent requests include it via credentials: 'include'.
- */
 app.get('/api/session/start', (req, res) => {
     const { token } = req.query;
     if (!token) return res.sendStatus(400);
@@ -1130,18 +1117,15 @@ app.get('/api/session/start', (req, res) => {
             return res.sendStatus(403);
         }
 
-        // Create persistent session in DB
         const customerToken = createCustomerSession(decoded.email, req);
 
-        // SET HTTPONLY COOKIE instead of returning token in body
         res.cookie(COOKIE_NAME, customerToken, getSessionCookieOptions(CUSTOMER_SESSION_DAYS));
 
         logger.info('SESSION_STARTED_COOKIE', { email: decoded.email });
 
-        // Return success + email for display (NOT the token)
-        res.json({ 
-            success: true, 
-            email: decoded.email 
+        res.json({
+            success: true,
+            email: decoded.email
         });
 
     } catch (e) {
@@ -1152,20 +1136,12 @@ app.get('/api/session/start', (req, res) => {
 
 
 // ===============================
-// SESSION LOGOUT (PHASE 0: NEW ENDPOINT)
+// SESSION LOGOUT (PHASE 0)
 // ===============================
-/**
- * Clears the HttpOnly session cookie and revokes the session in DB.
- * 
- * This is called by:
- * 1. The logout button on mis-pedidos.html
- * 2. The login.html page on load (to clear stale sessions)
- */
 app.post('/api/session/logout', (req, res) => {
     const token = req.cookies[COOKIE_NAME];
 
     if (token) {
-        // Revoke session in DB
         try {
             const decoded = jwt.verify(token, JWT_SECRET);
             if (decoded.session_id) {
@@ -1174,11 +1150,10 @@ app.post('/api/session/logout', (req, res) => {
                 logger.info('SESSION_REVOKED', { sessionId: decoded.session_id });
             }
         } catch (e) {
-            // Token might be expired/invalid — that's fine, still clear the cookie
+            // Token might be expired/invalid — still clear the cookie
         }
     }
 
-    // Clear the cookie regardless
     res.clearCookie(COOKIE_NAME, getClearCookieOptions());
 
     res.json({ success: true });
@@ -1186,14 +1161,8 @@ app.post('/api/session/logout', (req, res) => {
 
 
 // ===============================
-// CUSTOMER ORDERS (PHASE 0: COOKIE AUTH + returns email)
+// CUSTOMER ORDERS (PHASE 0: COOKIE AUTH)
 // ===============================
-/**
- * PHASE 0 CHANGE:
- * - Now uses verifyCustomerSession which reads from cookie first
- * - Returns { email, orders } so frontend can display user email
- *   without needing to decode JWT (which it can't access anymore)
- */
 app.get('/api/customer/orders', verifyCustomerSession, (req, res) => {
     try {
         const email = req.customer.email.toLowerCase();
@@ -1226,7 +1195,6 @@ app.get('/api/customer/orders', verifyCustomerSession, (req, res) => {
             };
         });
 
-        // PHASE 0: Return email alongside orders for frontend display
         res.json({
             email: email,
             orders: orders
@@ -1240,7 +1208,7 @@ app.get('/api/customer/orders', verifyCustomerSession, (req, res) => {
 
 
 // ===============================
-// MY-ORDERS (legacy — still uses Authorization header for backward compat)
+// MY-ORDERS (legacy)
 // ===============================
 app.get('/api/my-orders', (req, res) => {
     const auth = req.headers.authorization;
@@ -1398,9 +1366,9 @@ async function handleStripeSuccess(session) {
         }
 
         if (existingOrder.status === 'PAGADO') {
-            logger.warn('WEBHOOK_IDEMPOTENCY', { 
-                orderId, 
-                message: 'Pedido ya estaba PAGADO. Webhook duplicado ignorado.' 
+            logger.warn('WEBHOOK_IDEMPOTENCY', {
+                orderId,
+                message: 'Pedido ya estaba PAGADO. Webhook duplicado ignorado.'
             });
             return;
         }
@@ -1443,7 +1411,7 @@ async function handleStripeSuccess(session) {
 
         let parsed = {};
         parsed = JSON.parse(row.data);
-        
+
         const cliente = parsed.cliente;
         const pedido = parsed.pedido;
 
@@ -1483,9 +1451,9 @@ async function processOrderBackground(jobId, cliente, pedido) {
                     ]
                 });
 
-                logger.info('CLIENT_EMAIL_SENT', { 
-                    orderId: jobId, 
-                    email: cliente.email, 
+                logger.info('CLIENT_EMAIL_SENT', {
+                    orderId: jobId,
+                    email: cliente.email,
                     resendId: clientEmailRes.id,
                     resendFrom: clientEmailRes.from,
                     resendTo: clientEmailRes.to
@@ -1502,20 +1470,18 @@ async function processOrderBackground(jobId, cliente, pedido) {
                         ]
                     });
 
-                    logger.info('ADMIN_EMAIL_SENT', { 
-                        orderId: jobId, 
-                        resendId: adminEmailRes.id 
+                    logger.info('ADMIN_EMAIL_SENT', {
+                        orderId: jobId,
+                        resendId: adminEmailRes.id
                     });
                 }
             } catch (emailError) {
-                // Specific email error logging
-                logger.error('RESEND_API_ERROR', { 
-                    orderId: jobId, 
+                logger.error('RESEND_API_ERROR', {
+                    orderId: jobId,
                     error: emailError.message,
                     statusCode: emailError.statusCode || 'N/A',
                     name: emailError.name
                 });
-                // Don't throw — allow process to continue
             }
         }
     } catch (e) {
@@ -1575,13 +1541,41 @@ setTimeout(cleanupStaleReservations, 10000);
 
 
 // ===============================
+// ERROR HANDLERS (after all routes)
+// ===============================
+
+// CORS error handler — catches when cors() middleware rejects an origin
+// Without this, a CORS rejection produces a raw Express error (500, no CORS headers)
+app.use((err, req, res, next) => {
+    if (err.message && err.message.toLowerCase().includes('cors')) {
+        logger.warn('CORS_ERROR_HANDLED', { origin: req.headers.origin, path: req.originalUrl });
+        return res.status(403).json({ error: 'Origin not allowed' });
+    }
+    next(err);
+});
+
+// Global error handler — catches unexpected errors
+app.use((err, req, res, next) => {
+    logger.error('UNHANDLED_ROUTE_ERROR', {
+        error: err.message,
+        stack: err.stack,
+        path: req.originalUrl,
+        method: req.method
+    });
+    incrementErrorCount();
+    res.status(500).json({ error: 'Internal server error' });
+});
+
+
+// ===============================
 // START SERVER
 // ===============================
 const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 ETHERE4L Backend V${BACKEND_VERSION} corriendo en puerto ${PORT}`);
     console.log(`🔒 Auth: HttpOnly Cookie (Phase 0 Security)`);
     console.log(`🍪 Cookie: ${COOKIE_NAME} | SameSite=${IS_PRODUCTION ? 'None' : 'Lax'} | Secure=${IS_PRODUCTION}`);
-    logger.info('SERVER_STARTED', { port: PORT, version: BACKEND_VERSION, railway: isRailway, authMode: 'httponly_cookie' });
+    console.log(`🌐 CORS: ${UNIQUE_ORIGINS.length} origins allowed | credentials: true | preflight: explicit`);
+    logger.info('SERVER_STARTED', { port: PORT, version: BACKEND_VERSION, railway: isRailway, authMode: 'httponly_cookie', origins: UNIQUE_ORIGINS.length });
 });
 
 process.on('SIGTERM', () => {
